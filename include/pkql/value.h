@@ -42,6 +42,29 @@ class Value {
   // stored into a Float column.
   Value castTo(Type t) const;
 
+  // In-place setters for hot decode loops: overwrite the payload directly
+  // when the value already holds that type, instead of destroying and
+  // rebuilding the variant.
+  void setNull() {
+    if (v_.index() != 0) v_.emplace<0>();
+  }
+  void setBool(bool b) {
+    if (auto* p = std::get_if<bool>(&v_)) *p = b;
+    else v_.emplace<1>(b);
+  }
+  void setInt(int64_t x) {
+    if (auto* p = std::get_if<int64_t>(&v_)) *p = x;
+    else v_.emplace<2>(x);
+  }
+  void setFloat(double d) {
+    if (auto* p = std::get_if<double>(&v_)) *p = d;
+    else v_.emplace<3>(d);
+  }
+  void setText(const char* s, size_t n) {
+    if (auto* p = std::get_if<std::string>(&v_)) p->assign(s, n);  // reuses the string's buffer
+    else v_.emplace<4>(s, n);
+  }
+
   std::string toString() const;  // display form (text unquoted)
   std::string literal() const;    // source form (text quoted)
 

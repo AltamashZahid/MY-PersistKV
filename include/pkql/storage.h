@@ -88,12 +88,11 @@ void decodeStoredRowInto(const TableSchema& t, std::string_view key, std::string
 // payload column, so unread trailing columns are never even parsed.
 struct DecodePlan {
   size_t ncols = 0;
-  std::vector<int> key_cols;      // table column of each primary-key part, in key order
-  std::vector<bool> key_needed;
-  size_t key_parts = 0;           // decode this many key parts
-  std::vector<int> payload_cols;  // table column of each payload value, in order
-  std::vector<bool> payload_needed;
-  size_t payload_parts = 0;       // decode this many payload values
+  // One step per encoded value up to the last needed one: the table column
+  // to decode it into, or -1 to skip over it.
+  std::vector<int> key_steps;      // primary-key parts, in key order
+  std::vector<int> payload_steps;  // payload values, in order
+  std::vector<int> unused;         // columns the query never reads (kept null)
 
   DecodePlan(const TableSchema& t, const std::vector<bool>* needed);
 };

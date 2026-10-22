@@ -114,7 +114,7 @@ void encodeKey(const Value& v, std::string& out) {
   }
 }
 
-Value decodeKey(std::string_view& in) {
+void decodeKeyInto(std::string_view& in, Value* out) {
   if (in.empty()) throw Error("corrupt key: missing value");
   uint8_t tag = static_cast<uint8_t>(in[0]);
   in.remove_prefix(1);
@@ -128,13 +128,24 @@ Value decodeKey(std::string_view& in) {
       u = (u << 8) | (negative ? 0xFF - b : b);
     }
     in.remove_prefix(n);
-    return Value::integer(negative ? static_cast<int64_t>(~u) : static_cast<int64_t>(u));
+    if (out) out->setInt(negative ? static_cast<int64_t>(~u) : static_cast<int64_t>(u));
+    return;
   }
   switch (tag) {
-    case kNull: return Value::null();
-    case kFalse: return Value::boolean(false);
-    case kTrue: return Value::boolean(true);
-    case kFloat: return Value::real(orderedToFloat(getBigEndian(in)));
+    case kNull:
+      if (out) out->setNull();
+      return;
+    case kFalse:
+      if (out) out->setBool(false);
+      return;
+    case kTrue:
+      if (out) out->setBool(true);
+      return;
+    case kFloat: {
+      double d = orderedToFloat(getBigEndian(in));
+      if (out) out->setFloat(d);
+      return;
+    }
     case kText: {
       std::string s;
       while (true) {
@@ -148,7 +159,8 @@ Value decodeKey(std::string_view& in) {
         if (in.size() < 2) throw Error("corrupt key: unterminated text");
         if (in[1] == '\x01') {
           in.remove_prefix(2);
-          return Value::text(std::move(s));
+          if (out) out->setText(s.data(), s.size());
+          return;
         }
         s += '\0';  // escaped zero byte (0x00 0xFF)
         in.remove_prefix(2);
@@ -156,6 +168,12 @@ Value decodeKey(std::string_view& in) {
     }
   }
   throw Error("corrupt key: unknown type tag");
+}
+
+Value decodeKey(std::string_view& in) {
+  Value v;
+  decodeKeyInto(in, &v);
+  return v;
 }
 
 std::string prefixSuccessor(std::string prefix) {
@@ -202,17 +220,17 @@ void decodeValue(std::string_view& in, Value* out) {
   in.remove_prefix(1);
   switch (tag) {
     case kNull:
-      if (out) *out = Value::null();
+      if (out) out->setNull();
       return;
     case kFalse:
-      if (out) *out = Value::boolean(false);
+      if (out) out->setBool(false);
       return;
     case kTrue:
-      if (out) *out = Value::boolean(true);
+      if (out) out->setBool(true);
       return;
     case kInt: {
       int64_t x = unzigzag(getVarint(in));
-      if (out) *out = Value::integer(x);
+      if (out) out->setInt(x);
       return;
     }
     case kFloat: {
@@ -220,7 +238,7 @@ void decodeValue(std::string_view& in, Value* out) {
       if (out) {
         double d;
         std::memcpy(&d, in.data(), 8);
-        *out = Value::real(d);
+        out->setFloat(d);
       }
       in.remove_prefix(8);
       return;
@@ -228,7 +246,7 @@ void decodeValue(std::string_view& in, Value* out) {
     case kText: {
       uint64_t n = getVarint(in);
       if (in.size() < n) throw Error("corrupt row");
-      if (out) *out = Value::text(std::string(in.substr(0, n)));
+      if (out) out->setText(in.data(), n);
       in.remove_prefix(n);
       return;
     }

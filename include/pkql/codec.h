@@ -22,6 +22,7 @@ namespace pkql {
 //   text   0x06 + bytes, with 0x00 escaped as 0x00 0xFF, then 0x00 0x01
 void encodeKey(const Value& v, std::string& out);
 Value decodeKey(std::string_view& in);  // consumes one encoded value
+void decodeKeyInto(std::string_view& in, Value* out);  // same, into *out (or skip if null)
 
 // Smallest byte string greater than every string that starts with `prefix`
 // (empty if there is none).

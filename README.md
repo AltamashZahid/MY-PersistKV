@@ -82,7 +82,7 @@ before writing any of them, which avoids the "Halloween problem".
 
 | Test | What it checks |
 |---|---|
-| Unit tests (17) | encoding order (randomized), language semantics, error messages, update/delete index maintenance (including rows swapping primary keys), atomic statements, persistence, and **which plan the optimizer chooses** for each kind of query |
+| Unit tests (19) | encoding order (randomized), language semantics, error messages, update/delete index maintenance (including rows swapping primary keys), atomic statements, persistence, and **which plan the optimizer chooses** for each kind of query |
 | Planner-equivalence test | every query returns identical rows under all 8 combinations of optimizer features |
 | **Differential testing against SQLite** | random data loaded into both engines; thousands of randomly generated queries (filters with `and`/`or`/`not`/`in`/`starts_with`, 2- and 3-table joins, group-bys, sort with take) written in both PKQL and SQL; results must match under 3 optimizer configurations. **10,000+ executions, 0 mismatches.** |
 
@@ -96,35 +96,51 @@ cd build && ./pkql_tests && ./differential_test 1000
 ## Benchmark vs SQLite (honest numbers)
 
 `bench_vs_sqlite`: the same data (10K users, 1K products, 100K orders, 2 × 40K
-unindexed rows), the same indexes, a 16 MB page cache for both, and each query parsed
-fresh every time in both engines. Median of 5 runs; i5-13500H, NVMe SSD, Windows 11,
-g++ 16 `-O2`.
+unindexed rows), the same indexes, a 16 MB page cache for both, and each query
+parsed fresh every time in both engines. Runs alternate between the two engines
+(PKQL, SQLite, PKQL, ...) so both see the same machine state, and the median of
+9 is reported; two full runs agreed within about 10%. Hardware: i5-13500H, NVMe SSD,
+Windows 11, g++ 16 `-O2`.
 
 | Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite | PKQL plan |
 |---|---|---|---|---|
-| point lookup by primary key (×1000) | 10.8 | 4.4 | 2.45× | PointLookup |
-| secondary index lookup (×200) | 9.8 | 2.3 | 4.26× | IndexScan |
-| primary-key range, 5000 rows | 1.3 | 0.2 | 7.88× | TableScan (key range) |
-| full scan + group by | 35.7 | 30.9 | **1.16×** | HashAggregate < TableScan |
-| top 10 by unindexed column | 40.5 | 3.9 | 10.3× | TopN < TableScan |
-| first 10 by indexed column | 0.1 | 0.0 | — | Limit < IndexScan (no sort) |
-| selective join (city + age filter) | 3.4 | 0.3 | 9.7× | IndexJoin < IndexScan |
-| join all orders to products + group | 83.3 | 71.5 | **1.17×** | HashJoin |
-| aggregate, then join, then top 10 | 75.6 | 68.3 | **1.11×** | TopN < HashJoin < HashAggregate |
-| equi-join on unindexed columns | 86.5 | 44.5 | 1.94× | HashJoin |
+| join all orders to products + group | 44.4 | 104.0 | **0.43× (2.3× faster)** | HashJoin < TableScan × 2 |
+| full scan + group by | 32.7 | 70.3 | **0.47× (2.1× faster)** | HashAggregate < TableScan |
+| equi-join on unindexed columns | 49.7 | 79.4 | **0.63× (1.6× faster)** | HashJoin |
+| aggregate, then join, then top 10 | 61.1 | 90.2 | **0.68× (1.5× faster)** | TopN < HashJoin < HashAggregate |
+| point lookup by primary key (×1000) | 17.0 | 14.4 | 1.18× | PointLookup (cached plan) |
+| secondary index lookup (×200) | 8.9 | 6.4 | 1.39× | IndexScan |
+| first 10 by indexed column | 0.04 | 0.02 | 1.66× | Limit < IndexScan (sort removed) |
+| top 10 by unindexed column | 19.4 | 10.5 | 1.85× | TopN < TableScan |
+| primary-key range, 5000 rows | 1.1 | 0.5 | 2.01× | TableScan (key range) |
+| selective join (city + age filter) | 2.1 | 0.7 | 3.04× | IndexJoin < IndexScan (sorted fetch) |
 
-**SQLite is faster on every query.** On joins, aggregation and grouping, PKQL comes
-within 1.1–1.2× of it. On point lookups and small selective queries it is 2–10×
-slower. The plans are the right ones; the gap is the constant cost per row and per
-lookup:
+**PKQL beats SQLite on joins, aggregation and grouping** (1.5–2.3× faster). It is close
+on point and index lookups and still slower on raw scans and small selective
+queries. The remaining gap is per row: rows are decoded into tagged `Value` objects,
+one at a time (Volcano). A raw PersistKV scan costs about 11 ns per row, but decoding
+into `Value`s costs about 29 ns more. Closing that would take vectorized,
+column-at-a-time execution.
 
-- **Storage:** each PersistKV lookup costs more than a SQLite B-tree lookup.
-- **Values:** rows are decoded into tagged `Value` objects; SQLite reads the record bytes in place.
-- **Per-query overhead:** PKQL has no prepared statements, so it parses and plans every query from text.
+### How the gap was closed (each step measured first)
 
-How this was measured and improved: profiling showed that turning bytes into `Value`
-objects took about 60% of scan time. Column pruning, decoding values in place, and
-evaluating expressions by reference cut the full-scan queries by 2.8–4.6×.
+The first version was 2–10× slower than SQLite on every query. In order:
+
+| Change | What the profile showed | Effect |
+|---|---|---|
+| Column pruning; evaluating expressions by reference | building `Value`s took ~60% of scan time | full-scan queries 2.8–4.6× faster |
+| Plan cache with auto-parameterization | a point lookup spent 80% of its time parsing and planning | point lookups 1.44× → 1.10× of SQLite |
+| Zero-copy scans (PersistKV `scanRaw`); filtering inside the scan callback; reusing row buffers | every key and value was copied twice before decoding | 5,000-row range 2.5 → 0.95 ms |
+| Calibrated cost constants (lookup ≈ 10 sequential rows, measured) | the model assumed 4, so it over-used indexes | better plan choices |
+| PersistKV: zero-copy point lookups; **slotted pages** with binary search | every lookup copied 3 pages and compared keys one by one (~170 compares) | lookups 1.4 → 0.8 µs |
+| PersistKV: **append-aware splits** | ascending loads left pages 50% full | pages ~75% full |
+| Compact encoding: varint values, variable-length order-preserving integer keys, 1-byte ids | the database was 4× SQLite's size (29 MB vs 7 MB) and spilled out of the cache | 29 MB → 16 MB |
+| **Sorted index fetch** (like PostgreSQL's bitmap heap scan) | 1,000 matches meant 1,000 random lookups | one ordered pass; 0.73 vs 0.88 ms against a full scan |
+| Flat hash join; decode plans that stop at the last needed column | node allocation per build row; every column parsed | unindexed equi-join 61 → 28 ms (now faster than SQLite) |
+
+Tools used: phase timing (parse / plan / execute), layer-by-layer scan timing
+(storage → decode → cursor → operator), and minimum-of-N runs to filter out a noisy
+machine.
 
 ## Layout
 
@@ -149,4 +165,4 @@ third_party/persist_KV   the storage engine (submodule)
 - Writers are serialized (one statement at a time per engine).
 - Keys are limited to 128 bytes, because of the storage engine.
 - No subqueries inside expressions, no window functions, no multi-statement transactions.
-- No prepared statements or plan cache (see the benchmark).
+- Row-at-a-time execution over tagged `Value`s (see the benchmark); no vectorized execution yet.

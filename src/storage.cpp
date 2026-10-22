@@ -240,38 +240,33 @@ void decodeStoredRowInto(const TableSchema& t, std::string_view key, std::string
 
 DecodePlan::DecodePlan(const TableSchema& t, const std::vector<bool>* needed) : ncols(t.cols.size()) {
   auto want = [&](int c) { return !needed || (*needed)[c]; };
+  size_t last = 0;
   for (int c : t.pk) {
-    key_cols.push_back(c);
-    key_needed.push_back(want(c));
-    if (want(c)) key_parts = key_cols.size();
+    key_steps.push_back(want(c) ? c : -1);
+    if (want(c)) last = key_steps.size();
   }
+  key_steps.resize(last);  // stop after the last needed key part
+  last = 0;
   for (size_t i = 0; i < t.cols.size(); i++) {
     if (t.isPkColumn(static_cast<int>(i))) continue;
-    payload_cols.push_back(static_cast<int>(i));
-    payload_needed.push_back(want(static_cast<int>(i)));
-    if (want(static_cast<int>(i))) payload_parts = payload_cols.size();
+    payload_steps.push_back(want(static_cast<int>(i)) ? static_cast<int>(i) : -1);
+    if (want(static_cast<int>(i))) last = payload_steps.size();
+  }
+  payload_steps.resize(last);  // stop after the last needed payload value
+  for (size_t i = 0; i < t.cols.size(); i++) {
+    if (!want(static_cast<int>(i))) unused.push_back(static_cast<int>(i));
   }
 }
 
 void decodeStoredRowInto(const DecodePlan& plan, std::string_view key, std::string_view payload, Row& row) {
   if (row.size() != plan.ncols) row.assign(plan.ncols, Value());
   key.remove_prefix(prefixLength(key));  // 'r' + table id
-  for (size_t j = 0; j < plan.key_parts; j++) {
-    Value v = decodeKey(key);
-    if (plan.key_needed[j]) row[plan.key_cols[j]] = std::move(v);
-  }
-  for (size_t j = 0; j < plan.payload_parts; j++) {
-    Value* out = plan.payload_needed[j] ? &row[plan.payload_cols[j]] : nullptr;
+  for (int c : plan.key_steps) decodeKeyInto(key, c >= 0 ? &row[c] : nullptr);
+  for (int c : plan.payload_steps) {
     if (payload.empty()) throw Error("corrupt row");
-    decodeValue(payload, out);
+    decodeValue(payload, c >= 0 ? &row[c] : nullptr);
   }
-  // Columns the query never reads stay null (cheap to check, rarely set).
-  for (size_t j = 0; j < plan.key_cols.size(); j++) {
-    if (!plan.key_needed[j] && !row[plan.key_cols[j]].isNull()) row[plan.key_cols[j]] = Value();
-  }
-  for (size_t j = 0; j < plan.payload_cols.size(); j++) {
-    if (!plan.payload_needed[j] && !row[plan.payload_cols[j]].isNull()) row[plan.payload_cols[j]] = Value();
-  }
+  for (int c : plan.unused) row[c].setNull();  // columns the query never reads stay null
 }
 
 Row decodeStoredRow(const TableSchema& t, std::string_view key, std::string_view payload,

@@ -209,6 +209,10 @@ class ProjectOp : public Operator {
   Row in_;
 };
 
+// Hash join with a flat table: build rows live in one array, and buckets
+// and chains are plain integer arrays (no node allocation per row). Keys
+// are compared in place by reference, and output rows are written into
+// the caller's buffer, reusing its storage.
 class HashJoinOp : public Operator {
  public:
   HashJoinOp(PNode& n, std::unique_ptr<Operator> l, std::unique_ptr<Operator> r)
@@ -216,9 +220,24 @@ class HashJoinOp : public Operator {
 
   void open() override {
     right_->open();
-    table_.clear();
+    rows_.clear();
+    hashes_.clear();
     Row r;
-    while (right_->next(&r)) table_.emplace(keys(node_.right_keys, r), r);
+    while (right_->next(&r)) {
+      hashes_.push_back(keyHash(node_.right_keys, r));
+      rows_.push_back(std::move(r));
+      r = Row();
+    }
+    size_t buckets = 16;
+    while (buckets < rows_.size() * 2) buckets <<= 1;
+    mask_ = buckets - 1;
+    head_.assign(buckets, -1);
+    chain_.assign(rows_.size(), -1);
+    for (size_t i = 0; i < rows_.size(); i++) {
+      size_t b = hashes_[i] & mask_;
+      chain_[i] = head_[b];
+      head_[b] = static_cast<int32_t>(i);
+    }
     right_width_ = node_.kids[1]->schema.size();
     left_->open();
     have_left_ = false;
@@ -230,37 +249,56 @@ class HashJoinOp : public Operator {
         if (!left_->next(&cur_)) return false;
         have_left_ = true;
         matched_ = false;
-        range_ = table_.equal_range(keys(node_.left_keys, cur_));
+        hash_ = keyHash(node_.left_keys, cur_);
+        pos_ = head_[hash_ & mask_];
       }
-      while (range_.first != range_.second) {
-        Row out = concat(cur_, range_.first->second);
-        ++range_.first;
-        if (!node_.pred || isTrue(eval(*node_.pred, out))) {
+      while (pos_ >= 0) {
+        int32_t i = pos_;
+        pos_ = chain_[i];
+        if (hashes_[i] != hash_ || !keysEqual(cur_, rows_[i])) continue;
+        row->assign(cur_.begin(), cur_.end());
+        row->insert(row->end(), rows_[i].begin(), rows_[i].end());
+        if (!node_.pred || isTrue(eval(*node_.pred, *row))) {
           matched_ = true;
-          *row = std::move(out);
           return true;
         }
       }
       have_left_ = false;
       if (node_.left_join && !matched_) {
-        *row = concat(cur_, nullRow(right_width_));
+        row->assign(cur_.begin(), cur_.end());
+        row->resize(cur_.size() + right_width_);
+        for (size_t c = cur_.size(); c < row->size(); c++) (*row)[c] = Value();
         return true;
       }
     }
   }
 
  private:
-  static Row keys(const std::vector<ExprPtr>& exprs, const Row& r) {
-    Row k;
-    for (const ExprPtr& e : exprs) k.push_back(eval(*e, r));  // Value hashing treats 1 and 1.0 alike
-    return k;
+  // Value hashing treats 1 and 1.0 alike, matching compare().
+  static uint64_t keyHash(const std::vector<ExprPtr>& exprs, const Row& r) {
+    uint64_t h = 1469598103934665603ull;
+    Value scratch;
+    for (const ExprPtr& e : exprs) h = (h ^ evalRef(*e, r, scratch).hash()) * 1099511628211ull;
+    return h;
+  }
+
+  bool keysEqual(const Row& left, const Row& right) const {
+    Value a, b;
+    for (size_t k = 0; k < node_.left_keys.size(); k++) {
+      if (compare(evalRef(*node_.left_keys[k], left, a), evalRef(*node_.right_keys[k], right, b)) != 0) return false;
+    }
+    return true;
   }
 
   std::unique_ptr<Operator> left_, right_;
-  std::unordered_multimap<Row, Row, RowHash, RowEq> table_;
-  using Iter = std::unordered_multimap<Row, Row, RowHash, RowEq>::iterator;
-  std::pair<Iter, Iter> range_;
+  std::vector<Row> rows_;         // build side
+  std::vector<uint64_t> hashes_;  // key hash per build row
+  std::vector<int32_t> head_;     // bucket -> first build row (-1 = empty)
+  std::vector<int32_t> chain_;    // build row -> next row in the same bucket
+  size_t mask_ = 0;
   Row cur_;
+  uint64_t hash_ = 0;
+  int32_t pos_ = -1;
   bool have_left_ = false, matched_ = false;
   size_t right_width_ = 0;
 };
