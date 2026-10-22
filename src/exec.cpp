@@ -125,26 +125,20 @@ class KeyReader {
   bool next(Row* row) {
     if (point_pending_) {
       point_pending_ = false;
-      std::string payload;
-      if (point_key_.size() > pkv::kMaxKeySize || !db_.get(point_key_, &payload)) return false;
-      decodeStoredRowInto(plan_, point_key_, payload, *row);
+      if (point_key_.size() > pkv::kMaxKeySize || !fetch(point_key_, row)) return false;
       return !pred_ || isTrue(eval(*pred_, *row));
     }
     if (rows_) return rows_->next(row);
     while (pending_pos_ < pending_keys_.size()) {
       const std::string& rk = pending_keys_[pending_pos_++];
-      std::string payload;
-      if (!db_.get(rk, &payload)) throw Error("index " + p_.index->name + " points at a missing row");
-      decodeStoredRowInto(plan_, rk, payload, *row);
+      if (!fetch(rk, row)) throw Error("index " + p_.index->name + " points at a missing row");
       if (!pred_ || isTrue(eval(*pred_, *row))) return true;
     }
     if (!cursor_) return false;
     std::string key, value;
     while (cursor_->next(&key, &value)) {
       std::string rk = rowKeyFromIndexEntry(*p_.table, *p_.index, key);
-      std::string payload;
-      if (!db_.get(rk, &payload)) throw Error("index " + p_.index->name + " points at a missing row");
-      decodeStoredRowInto(plan_, rk, payload, *row);
+      if (!fetch(rk, row)) throw Error("index " + p_.index->name + " points at a missing row");
       if (!pred_ || isTrue(eval(*pred_, *row))) return true;
     }
     return false;
@@ -152,6 +146,13 @@ class KeyReader {
 
  private:
   const std::vector<bool>* needed() const { return p_.needed.empty() ? nullptr : &p_.needed; }
+
+  // Looks a row up by key and decodes it straight from the cached page.
+  bool fetch(const std::string& row_key, Row* row) {
+    return db_.getRaw(row_key, [&](const char* v, size_t n) {
+      decodeStoredRowInto(plan_, row_key, std::string_view(v, n), *row);
+    });
+  }
 
   pkv::DB& db_;
   const PNode& p_;
