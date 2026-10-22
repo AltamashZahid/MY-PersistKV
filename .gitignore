@@ -1,0 +1,4 @@
+build/
+test_data/
+bench_data/
+*.exe

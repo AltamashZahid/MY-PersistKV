@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC (ASan + UBSan)
+            cxx: g++
+            cmake_args: -DPKQL_SANITIZE=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          - name: Linux Clang
+            cxx: clang++
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install SQLite and Ninja
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev ninja-build
+      - name: Configure
+        run: CXX=${{ matrix.cxx }} cmake -S . -B build -G Ninja ${{ matrix.cmake_args }}
+      - name: Build
+        run: cmake --build build
+      - name: Unit tests
+        working-directory: build
+        run: ./pkql_tests
+      - name: Differential test vs SQLite (2000 random queries)
+        working-directory: build
+        run: ./differential_test 2000 ${{ github.run_number }}
