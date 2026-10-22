@@ -184,6 +184,8 @@ size_t prefixLength(std::string_view key) {
 
 }  // namespace
 
+size_t keyPrefixLength(std::string_view key) { return prefixLength(key); }
+
 std::string tablePrefix(uint32_t table_id) {
   std::string k = "r";
   putId(table_id, k);

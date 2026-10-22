@@ -41,7 +41,8 @@ add_library(pkql STATIC
   src/parser.cpp
   src/planner.cpp
   src/storage.cpp
-  src/value.cpp)
+  src/value.cpp
+  src/vector.cpp)
 target_include_directories(pkql PUBLIC include)
 target_link_libraries(pkql PUBLIC persistkv)
 

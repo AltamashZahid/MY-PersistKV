@@ -398,10 +398,11 @@ TEST(all_planner_settings_agree) {
   };
   for (const char* q : queries) {
     std::vector<Row> baseline;
-    for (int mask = 0; mask < 8; mask++) {
+    for (int mask = 0; mask < 16; mask++) {
       db.plannerOptions().reorder_joins = mask & 1;
       db.plannerOptions().use_indexes = mask & 2;
       db.plannerOptions().use_interesting_orders = mask & 4;
+      db.plannerOptions().vectorize = mask & 8;
       Result r = one(db, q);
       if (mask == 0) baseline = r.rows;
       else CHECK(r.rows == baseline);
@@ -455,6 +456,53 @@ TEST(plan_cache_reuses_plans_across_values_and_stays_correct) {
   Result wide = one(db, "from orders | filter created > 10 | aggregate { n = count() }");
   db.setPlanCache(false);
   CHECK(one(db, "from orders | filter created > 10 | aggregate { n = count() }").rows == wide.rows);
+}
+
+TEST(vectorized_execution_matches_row_execution) {
+  Engine db(freshDir("vectorized"), fast());
+  loadShop(db, 1000);
+  db.run(R"(
+    table n (id: int key, x: int?, f: float?, s: text?, b: bool?)
+  )");
+  std::vector<Row> rows;
+  std::mt19937 rng(11);
+  for (int i = 0; i < 5000; i++) {
+    auto maybe = [&](Value v) { return rng() % 7 == 0 ? Value::null() : v; };  // some nulls
+    rows.push_back({Value::integer(i), maybe(Value::integer(static_cast<int64_t>(rng() % 200) - 100)),
+                    maybe(Value::real((rng() % 10000) / 7.0)), maybe(Value::text("s" + std::to_string(rng() % 30))),
+                    maybe(Value::boolean(rng() % 2))});
+  }
+  db.insertRows("n", rows);
+  const char* queries[] = {
+      "from orders | aggregate { n = count(), s = sum(amount), lo = min(amount), hi = max(amount), a = avg(amount) }",
+      "from orders | filter id >= 3000 and id < 7000 and status == \"paid\" | aggregate { s = sum(amount), n = count() }",
+      "from orders | group status { n = count(), s = sum(amount), c = max(created) }",
+      "from orders | group user_id { n = count() } | sort user_id",
+      "from orders | sort -amount | take 10 | select id, amount",
+      "from orders | filter amount > 500 | sort created, id | take 25 | select id",
+      "from users | sort city, -age, id | take 40",
+      "from n | aggregate { c = count(), cx = count(x), sx = sum(x), ax = avg(x), mn = min(x), mx = max(x) }",
+      "from n | group s { c = count(), sf = sum(f), mins = min(s) } | sort s",
+      "from n | group x { c = count() } | sort x",
+      "from n | filter x < 0 | aggregate { c = count() }",
+      "from n | filter x != 5 and f >= 100.5 | aggregate { c = count(), s = sum(f) }",
+      "from n | filter s in [\"s1\", \"s2\", \"s7\"] or b == true | aggregate { c = count() }",
+      "from n | filter starts_with(s, \"s1\") | aggregate { c = count() }",
+      "from n | filter x > 1000 | aggregate { c = count(), s = sum(x), m = min(s) }",
+      "from n | sort -x, id | take 15 | select id, x",
+      "from n | sort s, f, id | take 15",
+  };
+  for (const char* q : queries) {
+    db.plannerOptions().vectorize = true;
+    Result v = one(db, q);
+    db.plannerOptions().vectorize = false;
+    Result r = one(db, q);
+    if (v.rows != r.rows) throw std::runtime_error(std::string("vectorized result differs for: ") + q);
+  }
+  db.plannerOptions().vectorize = true;
+  CHECK(has(plan(db, "from orders | group status { n = count() }"), "[vectorized]"));
+  CHECK(has(plan(db, "from orders | sort -amount | take 10"), "[vectorized]"));
+  CHECK(!has(plan(db, "from orders | group status, user_id { n = count() }"), "[vectorized]"));  // two keys: row path
 }
 
 TEST(explain_analyze_reports_actual_rows) {

@@ -380,7 +380,7 @@ Result Engine::query(const Statement& s) {
   std::string key;
   if (plan_cache_on_ && !s.explain && !s.fingerprint.empty()) {
     key = s.fingerprint + std::to_string(planner_.reorder_joins) + std::to_string(planner_.use_indexes) +
-          std::to_string(planner_.use_interesting_orders);
+          std::to_string(planner_.use_interesting_orders) + std::to_string(planner_.vectorize);
     auto it = plan_cache_.find(key);
     if (it != plan_cache_.end() && cacheValid(it->second)) {
       plan = it->second.plan;

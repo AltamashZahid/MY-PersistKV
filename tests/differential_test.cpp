@@ -361,13 +361,15 @@ int main(int argc, char** argv) {
     const char* name;
     PlannerOptions opts;
   };
-  Config configs[3];
+  Config configs[4];
   configs[0] = {"default", PlannerOptions()};
   configs[1] = {"no-indexes", PlannerOptions()};
   configs[1].opts.use_indexes = false;
   configs[2] = {"no-join-reorder", PlannerOptions()};
   configs[2].opts.reorder_joins = false;
   configs[2].opts.use_interesting_orders = false;
+  configs[3] = {"row-at-a-time", PlannerOptions()};
+  configs[3].opts.vectorize = false;
 
   int failures = 0, empty = 0;
   for (int i = 0; i < queries; i++) {
@@ -402,7 +404,7 @@ int main(int argc, char** argv) {
     if (failures > 10) break;
   }
   sqlite3_close(sq);
-  std::cout << "[" << (failures == 0 ? "PASS" : "FAIL") << "] " << queries << " random queries x 3 planner configs vs SQLite, "
+  std::cout << "[" << (failures == 0 ? "PASS" : "FAIL") << "] " << queries << " random queries x 4 planner configs vs SQLite, "
             << failures << " mismatches (" << empty << " queries had empty results; plan cache: " << pk.planCacheHits()
             << " hits, " << pk.planCacheMisses() << " misses)\n";
   return failures == 0 ? 0 : 1;

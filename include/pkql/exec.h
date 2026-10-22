@@ -28,6 +28,9 @@ struct ExecContext {
 
 std::unique_ptr<Operator> buildOperator(PNode& plan, ExecContext& ctx);
 
+// The encoded key range [lo, hi) a primary-key TableScan node reads.
+void tableScanRange(const PNode& scan, std::string* lo, std::string* hi);
+
 // Runs a plan to completion and returns every row.
 std::vector<Row> runPlan(PNode& plan, ExecContext& ctx);
 

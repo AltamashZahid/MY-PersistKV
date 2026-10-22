@@ -108,6 +108,7 @@ struct PNode {
   double startup = 0;  // cost before the first row (blocking operators)
   std::vector<int> order;  // output columns the rows arrive sorted by (ascending)
   bool order_needed = false;  // a parent relies on `order` (e.g. a sort it replaced)
+  bool vectorized = false;    // run by the vectorized executor (vector.cpp), with its scan child
   std::vector<ColEstimate> cols;
 
   // Filled in by `explain analyze`.
@@ -120,6 +121,7 @@ struct PlannerOptions {
   bool reorder_joins = true;        // dynamic-programming join ordering
   bool use_indexes = true;          // index scans and index joins
   bool use_interesting_orders = true;
+  bool vectorize = true;  // batch execution for aggregate / top-N over a table scan
 };
 
 PPtr optimize(const LPtr& logical, const PlannerOptions& opts = PlannerOptions());

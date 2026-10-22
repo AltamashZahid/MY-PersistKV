@@ -1,5 +1,7 @@
 #include "pkql/codec.h"
 
+#include "pkql/vector.h"
+
 #include <cstring>
 
 namespace pkql {
@@ -114,7 +116,45 @@ void encodeKey(const Value& v, std::string& out) {
   }
 }
 
-void decodeKeyInto(std::string_view& in, Value* out) {
+namespace {
+
+// Where a decoded value goes. The parsers below are shared by the row path
+// (into a Value) and the vectorized path (into a column array).
+struct ValueSink {
+  Value* v;
+  bool active() const { return v != nullptr; }
+  void null() { v->setNull(); }
+  void boolean(bool x) { v->setBool(x); }
+  void integer(int64_t x) { v->setInt(x); }
+  void real(double x) { v->setFloat(x); }
+  void text(const char* p, size_t n) { v->setText(p, n); }
+};
+
+struct ColumnSink {
+  ColumnVector* c;
+  size_t i;
+  bool active() const { return c != nullptr; }
+  void null() { c->nulls[i] = 1; }
+  void boolean(bool x) {
+    c->nulls[i] = 0;
+    c->ints[i] = x;
+  }
+  void integer(int64_t x) {
+    c->nulls[i] = 0;
+    c->ints[i] = x;
+  }
+  void real(double x) {
+    c->nulls[i] = 0;
+    c->floats[i] = x;
+  }
+  void text(const char* p, size_t n) {
+    c->nulls[i] = 0;
+    c->texts[i].assign(p, n);  // reuses the slot's buffer across batches
+  }
+};
+
+template <typename Sink>
+void parseKey(std::string_view& in, Sink& out) {
   if (in.empty()) throw Error("corrupt key: missing value");
   uint8_t tag = static_cast<uint8_t>(in[0]);
   in.remove_prefix(1);
@@ -128,22 +168,22 @@ void decodeKeyInto(std::string_view& in, Value* out) {
       u = (u << 8) | (negative ? 0xFF - b : b);
     }
     in.remove_prefix(n);
-    if (out) out->setInt(negative ? static_cast<int64_t>(~u) : static_cast<int64_t>(u));
+    if (out.active()) out.integer(negative ? static_cast<int64_t>(~u) : static_cast<int64_t>(u));
     return;
   }
   switch (tag) {
     case kNull:
-      if (out) out->setNull();
+      if (out.active()) out.null();
       return;
     case kFalse:
-      if (out) out->setBool(false);
+      if (out.active()) out.boolean(false);
       return;
     case kTrue:
-      if (out) out->setBool(true);
+      if (out.active()) out.boolean(true);
       return;
     case kFloat: {
       double d = orderedToFloat(getBigEndian(in));
-      if (out) out->setFloat(d);
+      if (out.active()) out.real(d);
       return;
     }
     case kText: {
@@ -159,7 +199,7 @@ void decodeKeyInto(std::string_view& in, Value* out) {
         if (in.size() < 2) throw Error("corrupt key: unterminated text");
         if (in[1] == '\x01') {
           in.remove_prefix(2);
-          if (out) out->setText(s.data(), s.size());
+          if (out.active()) out.text(s.data(), s.size());
           return;
         }
         s += '\0';  // escaped zero byte (0x00 0xFF)
@@ -168,6 +208,18 @@ void decodeKeyInto(std::string_view& in, Value* out) {
     }
   }
   throw Error("corrupt key: unknown type tag");
+}
+
+}  // namespace
+
+void decodeKeyInto(std::string_view& in, Value* out) {
+  ValueSink sink{out};
+  parseKey(in, sink);
+}
+
+void decodeKeyToColumn(std::string_view& in, ColumnVector* col, size_t i) {
+  ColumnSink sink{col, i};
+  parseKey(in, sink);
 }
 
 Value decodeKey(std::string_view& in) {
@@ -214,31 +266,34 @@ void encodeRow(const Row& values, std::string& out) {
   }
 }
 
-void decodeValue(std::string_view& in, Value* out) {
+namespace {
+
+template <typename Sink>
+void parseValue(std::string_view& in, Sink& out) {
   if (in.empty()) throw Error("corrupt row");
   uint8_t tag = static_cast<uint8_t>(in[0]);
   in.remove_prefix(1);
   switch (tag) {
     case kNull:
-      if (out) out->setNull();
+      if (out.active()) out.null();
       return;
     case kFalse:
-      if (out) out->setBool(false);
+      if (out.active()) out.boolean(false);
       return;
     case kTrue:
-      if (out) out->setBool(true);
+      if (out.active()) out.boolean(true);
       return;
     case kInt: {
       int64_t x = unzigzag(getVarint(in));
-      if (out) out->setInt(x);
+      if (out.active()) out.integer(x);
       return;
     }
     case kFloat: {
       if (in.size() < 8) throw Error("corrupt row");
-      if (out) {
+      if (out.active()) {
         double d;
         std::memcpy(&d, in.data(), 8);
-        out->setFloat(d);
+        out.real(d);
       }
       in.remove_prefix(8);
       return;
@@ -246,13 +301,25 @@ void decodeValue(std::string_view& in, Value* out) {
     case kText: {
       uint64_t n = getVarint(in);
       if (in.size() < n) throw Error("corrupt row");
-      if (out) out->setText(in.data(), n);
+      if (out.active()) out.text(in.data(), n);
       in.remove_prefix(n);
       return;
     }
     default:
       throw Error("corrupt row: unknown type tag");
   }
+}
+
+}  // namespace
+
+void decodeValue(std::string_view& in, Value* out) {
+  ValueSink sink{out};
+  parseValue(in, sink);
+}
+
+void decodeValueToColumn(std::string_view& in, ColumnVector* col, size_t i) {
+  ColumnSink sink{col, i};
+  parseValue(in, sink);
 }
 
 Row decodeRow(std::string_view in, const std::vector<bool>* keep) {

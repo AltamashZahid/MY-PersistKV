@@ -7,6 +7,7 @@
 #include <unordered_set>
 
 #include "pkql/codec.h"
+#include "pkql/vector.h"
 
 namespace pkql {
 
@@ -649,9 +650,19 @@ class Instrumented : public Operator {
 
 }  // namespace
 
+void tableScanRange(const PNode& p, std::string* lo, std::string* hi) {
+  std::vector<int> prefix(p.table->pk.begin(), p.table->pk.begin() + static_cast<long>(p.eq.size()));
+  keyRange(tablePrefix(p.table->id), evalAll(p.eq, Row(), p.table, &prefix), p, Row(), lo, hi);
+}
+
 std::unique_ptr<Operator> buildOperator(PNode& p, ExecContext& ctx) {
   auto kid = [&](size_t i) { return buildOperator(*p.kids[i], ctx); };
   std::unique_ptr<Operator> op;
+  if (p.vectorized) {
+    op = buildVectorizedOperator(p, ctx);
+    if (ctx.analyze) op = std::make_unique<Instrumented>(p, std::move(op));
+    return op;
+  }
   switch (p.kind) {
     case PKind::TableScan:
     case PKind::IndexScan: op = std::make_unique<ScanOp>(p, ctx); break;

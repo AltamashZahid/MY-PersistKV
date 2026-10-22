@@ -70,6 +70,7 @@ struct TableSchema {
 // ---------------------------------------------------------------------------
 
 std::string tablePrefix(uint32_t table_id);
+size_t keyPrefixLength(std::string_view key);  // length of "<kind><id>" at the start of a row or index key
 std::string indexPrefix(uint32_t index_id);
 std::string encodeKeyColumns(const Row& row, const std::vector<int>& cols);
 std::string rowKey(const TableSchema& t, const Row& row);

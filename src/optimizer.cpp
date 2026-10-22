@@ -8,6 +8,7 @@
 #include <map>
 
 #include "pkql/plan.h"
+#include "pkql/vector.h"
 
 namespace pkql {
 
@@ -1182,6 +1183,7 @@ void explainRec(const PNode& p, const std::string& prefix, bool last, bool root,
   out += prefix;
   if (!root) out += last ? "└─ " : "├─ ";
   out += describe(p);
+  if (p.vectorized) out += " [vectorized]";
   out += "  (est " + fmt(p.rows) + " rows, cost " + fmt(p.cost) + ")";
   if (actuals && p.executed) {
     char buf[64];
@@ -1277,6 +1279,7 @@ PPtr optimize(const LPtr& logical, const PlannerOptions& opts) {
   LPtr rewritten = rewrite(logical);
   PPtr plan = Planner(opts).plan(rewritten);
   prune(*plan, std::vector<bool>(plan->schema.size(), true));
+  if (opts.vectorize) markVectorized(*plan);
   return plan;
 }
 
