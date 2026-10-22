@@ -66,7 +66,7 @@ std::vector<Value> evalAll(const std::vector<ExprPtr>& exprs, const Row& row, co
 // Reads rows of one table through the primary key or a secondary index.
 class KeyReader {
  public:
-  KeyReader(pkv::DB& db, const PNode& p) : db_(db), p_(p) {}
+  KeyReader(pkv::DB& db, const PNode& p) : db_(db), p_(p), plan_(*p.table, p.needed.empty() ? nullptr : &p.needed) {}
 
   // `pred`, if given, is the scan's residual filter: rows that fail it are
   // dropped inside the storage scan without being copied out.
@@ -127,7 +127,7 @@ class KeyReader {
       point_pending_ = false;
       std::string payload;
       if (point_key_.size() > pkv::kMaxKeySize || !db_.get(point_key_, &payload)) return false;
-      *row = decodeStoredRow(*p_.table, point_key_, payload, needed());
+      decodeStoredRowInto(plan_, point_key_, payload, *row);
       return !pred_ || isTrue(eval(*pred_, *row));
     }
     if (rows_) return rows_->next(row);
@@ -135,7 +135,7 @@ class KeyReader {
       const std::string& rk = pending_keys_[pending_pos_++];
       std::string payload;
       if (!db_.get(rk, &payload)) throw Error("index " + p_.index->name + " points at a missing row");
-      *row = decodeStoredRow(*p_.table, rk, payload, needed());
+      decodeStoredRowInto(plan_, rk, payload, *row);
       if (!pred_ || isTrue(eval(*pred_, *row))) return true;
     }
     if (!cursor_) return false;
@@ -144,7 +144,7 @@ class KeyReader {
       std::string rk = rowKeyFromIndexEntry(*p_.table, *p_.index, key);
       std::string payload;
       if (!db_.get(rk, &payload)) throw Error("index " + p_.index->name + " points at a missing row");
-      *row = decodeStoredRow(*p_.table, rk, payload, needed());
+      decodeStoredRowInto(plan_, rk, payload, *row);
       if (!pred_ || isTrue(eval(*pred_, *row))) return true;
     }
     return false;
@@ -155,6 +155,7 @@ class KeyReader {
 
   pkv::DB& db_;
   const PNode& p_;
+  DecodePlan plan_;
   std::unique_ptr<Cursor> cursor_;    // secondary-index entries
   std::unique_ptr<RowCursor> rows_;  // primary-key range (or sorted index fetch)
   std::vector<std::string> pending_keys_;  // index matches to look up one by one

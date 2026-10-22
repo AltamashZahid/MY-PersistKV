@@ -79,7 +79,20 @@ struct Statement {
   // replaced by placeholders, and the values of those literals.
   std::string fingerprint;
   std::vector<Value> params;
+
+  // For the lexer-only fast path: the statement's skeleton (all literals as
+  // placeholders), the value of every literal token in order, and for each
+  // parameter which literal it came from and whether it was negated (-5).
+  std::string skeleton;
+  std::vector<Value> literals;
+  std::vector<int> param_literal;
+  std::vector<bool> param_negated;
 };
+
+// Lexes a single statement without parsing it: its skeleton and literal
+// values, in the same form parse() records them. False if the text is not
+// exactly one statement.
+bool skeletonOf(std::string_view text, std::string* skeleton, std::vector<Value>* literals);
 
 // Parses a script of one or more statements, separated by `;` or by line
 // breaks (a line starting with `|` continues the previous pipeline).

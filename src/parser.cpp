@@ -157,6 +157,31 @@ bool isAggregate(const std::string& s) {
   return false;
 }
 
+bool isLiteralToken(const Token& t) { return t.kind == Tok::Int || t.kind == Tok::Float || t.kind == Tok::String; }
+
+Value literalValue(const Token& t) {
+  if (t.kind == Tok::Int) return Value::integer(std::strtoll(t.text.c_str(), nullptr, 10));
+  if (t.kind == Tok::Float) return Value::real(std::strtod(t.text.c_str(), nullptr));
+  return Value::text(t.text);
+}
+
+// Tokens [start, end) with literal values replaced by typed placeholders.
+void skeletonTokens(const std::vector<Token>& toks, size_t start, size_t end, std::string* skeleton,
+                    std::vector<Value>* literals) {
+  skeleton->clear();
+  literals->clear();
+  for (size_t i = start; i < end; i++) {
+    const Token& t = toks[i];
+    if (isLiteralToken(t)) {
+      *skeleton += t.kind == Tok::Int ? "?i" : t.kind == Tok::Float ? "?f" : "?s";
+      literals->push_back(literalValue(t));
+    } else {
+      *skeleton += t.text;
+    }
+    *skeleton += '\x01';
+  }
+}
+
 class Parser {
  public:
   explicit Parser(std::vector<Token> toks) : t_(std::move(toks)) {}
@@ -213,6 +238,18 @@ class Parser {
   void fingerprint(Statement& s, size_t start, size_t end) {
     std::vector<int> param_tokens;
     markPipeline(s.pipeline, s, param_tokens);
+    // Map each parameter to its literal token's position among the
+    // statement's literal tokens (the fast path sees only tokens).
+    skeletonTokens(t_, start, end, &s.skeleton, &s.literals);
+    for (size_t pi = 0; pi < param_tokens.size(); pi++) {
+      int ordinal = 0;
+      for (int i = static_cast<int>(start); i < param_tokens[pi]; i++) {
+        if (isLiteralToken(t_[i])) ordinal++;
+      }
+      s.param_literal.push_back(ordinal);
+      // The parser folds `-5` into one literal: record the sign.
+      s.param_negated.push_back(compare(s.params[pi], literalValue(t_[param_tokens[pi]])) != 0);
+    }
     std::string fp;
     for (size_t i = start; i < end; i++) {
       bool is_param = std::find(param_tokens.begin(), param_tokens.end(), static_cast<int>(i)) != param_tokens.end();
@@ -605,5 +642,18 @@ class Parser {
 }  // namespace
 
 std::vector<Statement> parse(std::string_view text) { return Parser(lex(text)).script(); }
+
+bool skeletonOf(std::string_view text, std::string* skeleton, std::vector<Value>* literals) {
+  std::vector<Token> toks = lex(text);
+  size_t start = 0, end = toks.size() - 1;  // drop the End token
+  while (start < end && toks[start].kind == Tok::Semi) start++;
+  while (end > start && toks[end - 1].kind == Tok::Semi) end--;
+  if (start == end) return false;
+  for (size_t i = start; i < end; i++) {
+    if (toks[i].kind == Tok::Semi) return false;  // more than one statement
+  }
+  skeletonTokens(toks, start, end, skeleton, literals);
+  return true;
+}
 
 }  // namespace pkql

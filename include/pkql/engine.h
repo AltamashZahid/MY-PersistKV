@@ -8,6 +8,7 @@
 
 #include "persistkv/db.h"
 #include "pkql/ast.h"
+#include "pkql/exec.h"
 #include "pkql/plan.h"
 #include "pkql/storage.h"
 
@@ -45,6 +46,7 @@ class Engine {
   void setPlanCache(bool on) {
     plan_cache_on_ = on;
     plan_cache_.clear();
+    skeletons_.clear();
   }
   uint64_t planCacheHits() const { return cache_hits_; }
   uint64_t planCacheMisses() const { return cache_misses_; }
@@ -70,13 +72,29 @@ class Engine {
 
   struct CachedPlan {
     PPtr plan;
+    // The built operator tree, reused across executions: every operator
+    // resets its state in open(). Built on first use with exec_ctx_.
+    std::shared_ptr<Operator> op;
     Schema columns;
     uint64_t version = 0;
     std::vector<std::pair<const TableSchema*, uint64_t>> rows_when_planned;
   };
   bool cacheValid(const CachedPlan& c) const;
 
+  // Lexer-only fast path: statements that hit this map skip parsing.
+  struct Skeleton {
+    std::string plan_key;              // entry in plan_cache_
+    std::vector<int> param_literal;    // literal ordinal of each parameter
+    std::vector<bool> param_negated;
+    std::vector<int> fixed;            // literal ordinals that are not parameters...
+    std::vector<Value> fixed_values;   // ...and the values they must have
+  };
+  bool runFast(std::string_view text, Result* out);
+  Result runCached(CachedPlan& c, const std::vector<Value>& params);
+  std::unordered_map<std::string, Skeleton> skeletons_;
+
   pkv::DB db_;
+  ExecContext exec_ctx_{db_, false};  // long-lived: cached operators keep a reference to it
   Catalog catalog_;
   std::unordered_map<std::string, CachedPlan> plan_cache_;
   bool plan_cache_on_ = true;

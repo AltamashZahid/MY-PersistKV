@@ -93,10 +93,92 @@ Engine::Engine(const std::string& dir, const pkv::Options& options) : db_(dir, o
   catalog_.load();
 }
 
+namespace {
+
+void collectTables(const PNode& p, std::vector<const TableSchema*>& out) {
+  if (p.table) out.push_back(p.table);
+  for (const PPtr& k : p.kids) collectTables(*k, out);
+}
+
+void patchExpr(const ExprPtr& e, const std::vector<Value>& params) {
+  if (!e) return;
+  if (e->kind == ExprKind::Literal && e->param >= 0 && e->param < static_cast<int>(params.size())) {
+    Value v = params[e->param];
+    if (e->value.type() == Type::Float && v.type() == Type::Int) v = v.castTo(Type::Float);
+    e->value = std::move(v);
+  }
+  for (const ExprPtr& a : e->args) patchExpr(a, params);
+}
+
+// Puts this execution's literal values into a cached plan.
+void patchPlan(PNode& p, const std::vector<Value>& params) {
+  for (const ExprPtr& e : p.eq) patchExpr(e, params);
+  patchExpr(p.lo, params);
+  patchExpr(p.hi, params);
+  patchExpr(p.pred, params);
+  for (const ExprPtr& e : p.left_keys) patchExpr(e, params);
+  for (const ExprPtr& e : p.right_keys) patchExpr(e, params);
+  for (const ExprPtr& e : p.exprs) patchExpr(e, params);
+  for (const AggSpec& a : p.aggs) patchExpr(a.arg, params);
+  for (const SortSpec& s : p.sort) patchExpr(s.expr, params);
+  for (const PPtr& k : p.kids) patchPlan(*k, params);
+}
+
+}  // namespace
+
 std::vector<Result> Engine::run(std::string_view script) {
   std::vector<Result> out;
+  Result fast;
+  if (runFast(script, &fast)) {
+    out.push_back(std::move(fast));
+    return out;
+  }
   for (const Statement& s : parse(script)) out.push_back(execute(s));
   return out;
+}
+
+// A repeated query shape whose plan is cached: lex, look up the skeleton,
+// check the non-parameter literals, and run, without building a syntax tree.
+bool Engine::runFast(std::string_view text, Result* out) {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!plan_cache_on_ || skeletons_.empty()) return false;
+  std::string skeleton;
+  std::vector<Value> literals;
+  if (!skeletonOf(text, &skeleton, &literals)) return false;
+  skeleton += std::to_string(planner_.reorder_joins) + std::to_string(planner_.use_indexes) +
+              std::to_string(planner_.use_interesting_orders) + std::to_string(planner_.vectorize);
+  auto sk = skeletons_.find(skeleton);
+  if (sk == skeletons_.end()) return false;
+  const Skeleton& s = sk->second;
+  for (size_t i = 0; i < s.fixed.size(); i++) {
+    if (literals[s.fixed[i]] != s.fixed_values[i] || literals[s.fixed[i]].type() != s.fixed_values[i].type()) return false;
+  }
+  auto pc = plan_cache_.find(s.plan_key);
+  if (pc == plan_cache_.end() || !cacheValid(pc->second)) return false;
+  std::vector<Value> params;
+  for (size_t i = 0; i < s.param_literal.size(); i++) {
+    Value v = literals[s.param_literal[i]];
+    if (s.param_negated[i]) v = v.type() == Type::Int ? Value::integer(-v.asInt()) : Value::real(-v.asFloat());
+    params.push_back(std::move(v));
+  }
+  cache_hits_++;
+  *out = runCached(pc->second, params);
+  return true;
+}
+
+Result Engine::runCached(CachedPlan& c, const std::vector<Value>& params) {
+  patchPlan(*c.plan, params);
+  auto t0 = std::chrono::steady_clock::now();
+  Result r;
+  if (!c.op) c.op = buildOperator(*c.plan, exec_ctx_);
+  c.op->open();
+  Row row;
+  while (c.op->next(&row)) r.rows.push_back(row);
+  double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  r.columns = c.columns;
+  r.has_rows = true;
+  r.message = fmtMs(ms);
+  return r;
 }
 
 Result Engine::execute(const Statement& s) {
@@ -326,38 +408,7 @@ void Engine::insertRows(const std::string& name, const std::vector<Row>& rows) {
 // Queries, updates and deletes
 // ---------------------------------------------------------------------------
 
-namespace {
 
-void collectTables(const PNode& p, std::vector<const TableSchema*>& out) {
-  if (p.table) out.push_back(p.table);
-  for (const PPtr& k : p.kids) collectTables(*k, out);
-}
-
-void patchExpr(const ExprPtr& e, const std::vector<Value>& params) {
-  if (!e) return;
-  if (e->kind == ExprKind::Literal && e->param >= 0 && e->param < static_cast<int>(params.size())) {
-    Value v = params[e->param];
-    if (e->value.type() == Type::Float && v.type() == Type::Int) v = v.castTo(Type::Float);
-    e->value = std::move(v);
-  }
-  for (const ExprPtr& a : e->args) patchExpr(a, params);
-}
-
-// Puts this execution's literal values into a cached plan.
-void patchPlan(PNode& p, const std::vector<Value>& params) {
-  for (const ExprPtr& e : p.eq) patchExpr(e, params);
-  patchExpr(p.lo, params);
-  patchExpr(p.hi, params);
-  patchExpr(p.pred, params);
-  for (const ExprPtr& e : p.left_keys) patchExpr(e, params);
-  for (const ExprPtr& e : p.right_keys) patchExpr(e, params);
-  for (const ExprPtr& e : p.exprs) patchExpr(e, params);
-  for (const AggSpec& a : p.aggs) patchExpr(a.arg, params);
-  for (const SortSpec& s : p.sort) patchExpr(s.expr, params);
-  for (const PPtr& k : p.kids) patchPlan(*k, params);
-}
-
-}  // namespace
 
 bool Engine::cacheValid(const CachedPlan& c) const {
   if (c.version != catalog_version_) return false;
@@ -383,10 +434,8 @@ Result Engine::query(const Statement& s) {
           std::to_string(planner_.use_interesting_orders) + std::to_string(planner_.vectorize);
     auto it = plan_cache_.find(key);
     if (it != plan_cache_.end() && cacheValid(it->second)) {
-      plan = it->second.plan;
-      columns = it->second.columns;
-      patchPlan(*plan, s.params);
       cache_hits_++;
+      return runCached(it->second, s.params);
     }
   }
   if (!plan) {
@@ -404,6 +453,21 @@ Result Engine::query(const Statement& s) {
       collectTables(*plan, tables);
       for (const TableSchema* t : tables) c.rows_when_planned.push_back({t, t->stats.rows});
       plan_cache_[key] = std::move(c);
+      if (!s.skeleton.empty()) {
+        Skeleton sk;
+        sk.plan_key = key;
+        sk.param_literal = s.param_literal;
+        sk.param_negated = s.param_negated;
+        for (size_t i = 0; i < s.literals.size(); i++) {
+          if (std::find(s.param_literal.begin(), s.param_literal.end(), static_cast<int>(i)) == s.param_literal.end()) {
+            sk.fixed.push_back(static_cast<int>(i));
+            sk.fixed_values.push_back(s.literals[i]);
+          }
+        }
+        if (skeletons_.size() >= 1024) skeletons_.clear();
+        skeletons_[s.skeleton + std::to_string(planner_.reorder_joins) + std::to_string(planner_.use_indexes) +
+                   std::to_string(planner_.use_interesting_orders) + std::to_string(planner_.vectorize)] = std::move(sk);
+      }
     }
   }
 
