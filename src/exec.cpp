@@ -14,6 +14,11 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+// A random lookup costs about this many raw scan steps (measured: ~0.8 us
+// vs ~11 ns, rounded down to stay conservative). Keep in sync with the
+// optimizer's kSkipRow.
+constexpr double kLookupVsSkip = 50.0;
+
 struct RowEq {
   bool operator()(const Row& a, const Row& b) const { return a == b; }
 };
@@ -68,6 +73,8 @@ class KeyReader {
     done_ = false;
     cursor_.reset();
     rows_.reset();
+    pending_keys_.clear();
+    pending_pos_ = 0;
     pred_ = pred;
     const std::vector<int>& cols = p_.index ? p_.index->cols : p_.table->pk;
     if (p_.point && !p_.index && eq.size() == cols.size()) {
@@ -79,8 +86,39 @@ class KeyReader {
     point_pending_ = false;
     std::string lo, hi;
     keyRange(p_.index ? indexPrefix(p_.index->id) : tablePrefix(p_.table->id), eq, p_, ctx_row, &lo, &hi);
-    if (p_.index) cursor_ = std::make_unique<Cursor>(db_, lo, hi);
-    else rows_ = std::make_unique<RowCursor>(db_, *p_.table, lo, hi, needed(), pred);
+    if (!p_.index) {
+      rows_ = std::make_unique<RowCursor>(db_, *p_.table, lo, hi, needed(), pred);
+      return;
+    }
+    cursor_ = std::make_unique<Cursor>(db_, lo, hi);
+    // A sorted fetch returns rows in primary-key order, so it is only used
+    // when nothing above relies on the index's order.
+    if (p_.kind == PKind::IndexScan && !p_.order_needed) startSortedFetchIfCheaper();
+  }
+
+  // Sorted index fetch (like a bitmap heap scan): when an index scan matches
+  // many rows, collect their keys, sort them, and read the table once in key
+  // order, decoding only those rows, instead of one random lookup per row.
+  // Chosen when matches x lookup cost exceeds one pass over the table.
+  void startSortedFetchIfCheaper() {
+    std::vector<std::string> keys;
+    std::string k, v;
+    double table_rows = static_cast<double>(p_.table->stats.rows);
+    while (cursor_->next(&k, &v)) {
+      keys.push_back(rowKeyFromIndexEntry(*p_.table, *p_.index, k));
+    }
+    cursor_.reset();
+    if (static_cast<double>(keys.size()) * kLookupVsSkip < table_rows) {
+      pending_keys_ = std::move(keys);  // few matches: look each one up
+      pending_pos_ = 0;
+      return;
+    }
+    std::sort(keys.begin(), keys.end());
+    std::string prefix = tablePrefix(p_.table->id);
+    std::string lo = keys.empty() ? prefix : keys.front();
+    std::string hi = keys.empty() ? prefix : prefixSuccessor(keys.back());
+    rows_ = std::make_unique<RowCursor>(db_, *p_.table, lo, hi, needed(), pred_);
+    rows_->onlyKeys(std::move(keys));
   }
 
   bool next(Row* row) {
@@ -92,6 +130,13 @@ class KeyReader {
       return !pred_ || isTrue(eval(*pred_, *row));
     }
     if (rows_) return rows_->next(row);
+    while (pending_pos_ < pending_keys_.size()) {
+      const std::string& rk = pending_keys_[pending_pos_++];
+      std::string payload;
+      if (!db_.get(rk, &payload)) throw Error("index " + p_.index->name + " points at a missing row");
+      *row = decodeStoredRow(*p_.table, rk, payload, needed());
+      if (!pred_ || isTrue(eval(*pred_, *row))) return true;
+    }
     if (!cursor_) return false;
     std::string key, value;
     while (cursor_->next(&key, &value)) {
@@ -110,7 +155,9 @@ class KeyReader {
   pkv::DB& db_;
   const PNode& p_;
   std::unique_ptr<Cursor> cursor_;    // secondary-index entries
-  std::unique_ptr<RowCursor> rows_;  // primary-key range
+  std::unique_ptr<RowCursor> rows_;  // primary-key range (or sorted index fetch)
+  std::vector<std::string> pending_keys_;  // index matches to look up one by one
+  size_t pending_pos_ = 0;
   const Expr* pred_ = nullptr;
   std::string point_key_;
   bool point_pending_ = false;

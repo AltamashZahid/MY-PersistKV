@@ -384,6 +384,24 @@ void RowCursor::fill() {
       done_ = true;
       return false;
     }
+    if (use_keys_) {
+      // Merge against the sorted key list: skip rows that are not on it.
+      while (key_pos_ < keys_.size() && keys_[key_pos_].compare(0, std::string::npos, k, kl) < 0) key_pos_++;
+      if (key_pos_ == keys_.size()) {
+        done_ = true;
+        return false;
+      }
+      bool wanted = keys_[key_pos_].compare(0, std::string::npos, k, kl) == 0;
+      if (!wanted) {
+        if (++scanned >= max_scan) {
+          last.assign(k, kl);
+          stopped_early = true;
+          return false;
+        }
+        return true;
+      }
+      key_pos_++;
+    }
     if (count_ == buf_.size()) buf_.emplace_back();
     Row& row = buf_[count_];
     decodeStoredRowInto(plan_, std::string_view(k, kl), std::string_view(v, vl), row);

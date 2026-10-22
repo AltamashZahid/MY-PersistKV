@@ -20,6 +20,7 @@ namespace {
 constexpr double kSeqRow = 1.0;
 constexpr double kLookup = 10.0;
 constexpr double kIndexEntry = 0.7;
+constexpr double kSkipRow = 0.2;  // passing over a row without decoding it (sorted index fetch)
 constexpr double kPred = 0.05;
 constexpr double kHashBuild = 1.5;
 constexpr double kHashProbe = 1.0;
@@ -528,8 +529,15 @@ PPtr Planner::planAccess(const LeafInfo& leaf, const std::vector<int>* wanted) {
     p->pred = makeConjunction(residual);
     p->schema = leaf.schema;
     p->rows = p->point ? std::min(out_rows, 1.0) : out_rows;
-    double per_row = cand.index ? kIndexEntry + kLookup : kSeqRow;
-    p->cost = p->point ? kLookup : kLookup + scanned * per_row;
+    if (cand.index) {
+      // Fetch matches one lookup each, or (sorted index fetch) in one pass
+      // over the table that decodes only the matches: whichever is cheaper.
+      double sorted_fetch = n * kSkipRow + scanned * kSeqRow + sortCost(scanned);
+      double fetch = std::min(scanned * kLookup, sorted_fetch);
+      p->cost = kLookup + scanned * kIndexEntry + fetch;
+    } else {
+      p->cost = p->point ? kLookup : kLookup + scanned * kSeqRow;
+    }
     p->cost += (p->point ? 1.0 : scanned) * kPred * static_cast<double>(residual.size());
     p->order = order;
     p->cols = cols;
@@ -851,6 +859,24 @@ PPtr Planner::planLeftJoin(const LPtr& n) {
   return r.plan;
 }
 
+// Records that the plan's output order is relied on, down to the scan that
+// produces it, so the executor keeps that order (no sorted index fetch).
+void markOrderNeeded(PNode& p) {
+  p.order_needed = true;
+  switch (p.kind) {
+    case PKind::Filter:
+    case PKind::Project:
+    case PKind::Limit:
+    case PKind::HashJoin:
+    case PKind::IndexJoin:
+    case PKind::NestedLoopJoin:
+      markOrderNeeded(*p.kids[0]);  // these pass their (first) input's order through
+      break;
+    default:
+      break;
+  }
+}
+
 PPtr Planner::planSort(const LPtr& sort, const LPtr& limit) {
   const LPtr& in = sort->kids[0];
   std::vector<int> wanted;
@@ -867,6 +893,7 @@ PPtr Planner::planSort(const LPtr& sort, const LPtr& limit) {
   PPtr sorted;
   if (simple && startsWith(any->order, wanted)) {
     sorted = any;  // already in order
+    markOrderNeeded(*sorted);
   } else {
     sorted = makeP(k >= 0 ? PKind::TopN : PKind::Sort);
     sorted->kids = {any};
@@ -891,7 +918,10 @@ PPtr Planner::planSort(const LPtr& sort, const LPtr& limit) {
         double frac = std::min(1.0, static_cast<double>(k) / std::max(1.0, ordered->rows));
         cost_b = ordered->startup + (ordered->cost - ordered->startup) * frac;
       }
-      if (cost_b < cost_a) sorted = ordered;
+      if (cost_b < cost_a) {
+        sorted = ordered;
+        markOrderNeeded(*sorted);
+      }
     }
   }
   return sorted;

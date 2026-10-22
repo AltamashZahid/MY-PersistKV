@@ -107,6 +107,7 @@ struct PNode {
   double cost = 0;     // total cost to produce every row
   double startup = 0;  // cost before the first row (blocking operators)
   std::vector<int> order;  // output columns the rows arrive sorted by (ascending)
+  bool order_needed = false;  // a parent relies on `order` (e.g. a sort it replaced)
   std::vector<ColEstimate> cols;
 
   // Filled in by `explain analyze`.

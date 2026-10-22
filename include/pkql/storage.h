@@ -171,6 +171,13 @@ class RowCursor {
 
   bool next(Row* row);
 
+  // Restricts the scan to these row keys (sorted, unique): other rows are
+  // passed over without being decoded. Used for sorted index fetches.
+  void onlyKeys(std::vector<std::string> keys) {
+    keys_ = std::move(keys);
+    use_keys_ = true;
+  }
+
  private:
   void fill();
 
@@ -180,6 +187,9 @@ class RowCursor {
   const std::vector<bool>* needed_;
   const Expr* pred_;
   DecodePlan plan_;
+  std::vector<std::string> keys_;
+  size_t key_pos_ = 0;
+  bool use_keys_ = false;
   std::vector<Row> buf_;  // reused across fills: rows are swapped, not reallocated
   size_t count_ = 0;      // valid rows in buf_
   size_t pos_ = 0;

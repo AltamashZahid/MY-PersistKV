@@ -299,9 +299,26 @@ TEST(access_path_selection) {
   // Half the table matches: reading it in full is cheaper than 10,000 index lookups.
   CHECK(has(plan(db, "from orders | filter created > 500000"), "TableScan orders (full)"));
   CHECK(has(plan(db, "from orders | filter created > 999000"), "IndexScan orders.orders_created"));
-  // 1 city in 8 is 12.5% of users: fetching each match by key costs more
-  // than reading the table once, so a full scan wins (measured, see README).
-  CHECK(has(plan(db, "from users | filter city == \"Pune\""), "TableScan users (full)"));
+  // 1 city in 8 is 12.5% of users: one random lookup per match would lose to
+  // a full scan, but a sorted index fetch (one ordered pass decoding only the
+  // matches) beats it (measured: 0.73 ms vs 0.88 ms at 10K users).
+  CHECK(has(plan(db, "from users | filter city == \"Pune\""), "IndexScan users.users_city"));
+}
+
+TEST(sorted_index_fetch_keeps_results_and_order_where_needed) {
+  Engine db(freshDir("sorted_fetch"), fast());
+  loadShop(db, 2000);
+  // Many matches: fetched in one sorted pass. Same rows as without indexes.
+  const char* q = "from users | filter city == \"Delhi\" | select id, age | sort id";
+  Result with = one(db, q);
+  db.plannerOptions().use_indexes = false;
+  Result without = one(db, q);
+  CHECK(with.rows == without.rows && with.rows.size() == 250);
+  db.plannerOptions().use_indexes = true;
+  // When a sort is replaced by the index order, that order must survive.
+  Result ordered = one(db, "from orders | sort created | take 50 | select id, created");
+  CHECK(ordered.rows.size() == 50);
+  for (size_t i = 1; i < ordered.rows.size(); i++) CHECK(compare(ordered.rows[i - 1][1], ordered.rows[i][1]) <= 0);
 }
 
 // Estimated rows of the plan's root, parsed from explain output.
