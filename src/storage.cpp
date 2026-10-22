@@ -1,6 +1,9 @@
 #include "pkql/storage.h"
 
+#include <algorithm>
+
 #include "pkql/codec.h"
+#include "pkql/expr.h"
 
 namespace pkql {
 
@@ -22,6 +25,10 @@ std::string checkedKey(std::string key) {
 }
 
 const std::string kNextIdKey = "mn";
+const std::string kFormatKey = "mv";
+// 2: compact encodings (varint row values, variable-length integer keys,
+// 1-byte object ids). Databases from format 1 cannot be read.
+const std::string kFormatVersion = "2";
 
 std::string schemaKey(const std::string& name) { return "mt" + name; }
 
@@ -151,15 +158,41 @@ bool TableSchema::isPkColumn(int col) const {
   return false;
 }
 
+namespace {
+
+// Object ids in key prefixes are self-delimiting (the first byte gives the
+// length), so small ids cost 1 byte instead of 4: below 0x80 one byte,
+// below 0x4000 two bytes, otherwise 0xC0 + 4 bytes.
+void putId(uint32_t id, std::string& out) {
+  if (id < 0x80) {
+    out += static_cast<char>(id);
+  } else if (id < 0x4000) {
+    out += static_cast<char>(0x80 | (id >> 8));
+    out += static_cast<char>(id & 0xFF);
+  } else {
+    out += static_cast<char>(0xC0);
+    putU32(id, out);
+  }
+}
+
+// Length of the "<kind><id>" prefix at the start of a row or index key.
+size_t prefixLength(std::string_view key) {
+  if (key.size() < 2) throw Error("corrupt key: missing prefix");
+  uint8_t b = static_cast<uint8_t>(key[1]);
+  return b < 0x80 ? 2 : b < 0xC0 ? 3 : 6;
+}
+
+}  // namespace
+
 std::string tablePrefix(uint32_t table_id) {
   std::string k = "r";
-  putU32(table_id, k);
+  putId(table_id, k);
   return k;
 }
 
 std::string indexPrefix(uint32_t index_id) {
   std::string k = "x";
-  putU32(index_id, k);
+  putId(index_id, k);
   return k;
 }
 
@@ -187,25 +220,69 @@ std::string indexKey(const TableSchema& t, const IndexSchema& ix, const Row& row
   return checkedKey(indexPrefix(ix.id) + encodeKeyColumns(row, ix.cols) + encodeKeyColumns(row, t.pk));
 }
 
-Row decodeStoredRow(const TableSchema& t, std::string_view key, std::string_view payload,
-                    const std::vector<bool>* needed) {
-  Row row(t.cols.size());
-  key.remove_prefix(5);  // 'r' + table id
+void decodeStoredRowInto(const TableSchema& t, std::string_view key, std::string_view payload,
+                         const std::vector<bool>* needed, Row& row) {
+  row.resize(t.cols.size());
+  key.remove_prefix(prefixLength(key));  // 'r' + table id
   for (int c : t.pk) {
     Value v = decodeKey(key);
-    if (!needed || (*needed)[c]) row[c] = std::move(v);
+    row[c] = (!needed || (*needed)[c]) ? std::move(v) : Value();
   }
   // The payload holds the non-key columns in table order.
   for (size_t i = 0; i < t.cols.size(); i++) {
     if (t.isPkColumn(static_cast<int>(i))) continue;
     if (payload.empty()) throw Error("corrupt row in table " + t.name);
-    decodeValue(payload, needed && !(*needed)[i] ? nullptr : &row[i]);
+    bool keep = !needed || (*needed)[i];
+    if (!keep) row[i] = Value();
+    decodeValue(payload, keep ? &row[i] : nullptr);
   }
+}
+
+DecodePlan::DecodePlan(const TableSchema& t, const std::vector<bool>* needed) : ncols(t.cols.size()) {
+  auto want = [&](int c) { return !needed || (*needed)[c]; };
+  for (int c : t.pk) {
+    key_cols.push_back(c);
+    key_needed.push_back(want(c));
+    if (want(c)) key_parts = key_cols.size();
+  }
+  for (size_t i = 0; i < t.cols.size(); i++) {
+    if (t.isPkColumn(static_cast<int>(i))) continue;
+    payload_cols.push_back(static_cast<int>(i));
+    payload_needed.push_back(want(static_cast<int>(i)));
+    if (want(static_cast<int>(i))) payload_parts = payload_cols.size();
+  }
+}
+
+void decodeStoredRowInto(const DecodePlan& plan, std::string_view key, std::string_view payload, Row& row) {
+  if (row.size() != plan.ncols) row.assign(plan.ncols, Value());
+  key.remove_prefix(prefixLength(key));  // 'r' + table id
+  for (size_t j = 0; j < plan.key_parts; j++) {
+    Value v = decodeKey(key);
+    if (plan.key_needed[j]) row[plan.key_cols[j]] = std::move(v);
+  }
+  for (size_t j = 0; j < plan.payload_parts; j++) {
+    Value* out = plan.payload_needed[j] ? &row[plan.payload_cols[j]] : nullptr;
+    if (payload.empty()) throw Error("corrupt row");
+    decodeValue(payload, out);
+  }
+  // Columns the query never reads stay null (cheap to check, rarely set).
+  for (size_t j = 0; j < plan.key_cols.size(); j++) {
+    if (!plan.key_needed[j] && !row[plan.key_cols[j]].isNull()) row[plan.key_cols[j]] = Value();
+  }
+  for (size_t j = 0; j < plan.payload_cols.size(); j++) {
+    if (!plan.payload_needed[j] && !row[plan.payload_cols[j]].isNull()) row[plan.payload_cols[j]] = Value();
+  }
+}
+
+Row decodeStoredRow(const TableSchema& t, std::string_view key, std::string_view payload,
+                    const std::vector<bool>* needed) {
+  Row row;
+  decodeStoredRowInto(t, key, payload, needed, row);
   return row;
 }
 
 std::string rowKeyFromIndexEntry(const TableSchema& t, const IndexSchema& ix, std::string_view entry) {
-  entry.remove_prefix(5);  // 'x' + index id
+  entry.remove_prefix(prefixLength(entry));  // 'x' + index id
   for (size_t i = 0; i < ix.cols.size(); i++) decodeKey(entry);  // skip the indexed columns
   return tablePrefix(t.id) + std::string(entry);
 }
@@ -223,6 +300,10 @@ void Catalog::load() {
     blobs.push_back(val);
     return true;
   });
+  std::string format;
+  if (!blobs.empty() && (!db_.get(kFormatKey, &format) || format != kFormatVersion)) {
+    throw Error("this database was created by an older PKQL storage format; re-create it");
+  }
   for (const std::string& blob : blobs) {
     auto t = std::make_unique<TableSchema>(deserializeSchema(blob));
     std::string stats;
@@ -244,6 +325,7 @@ uint32_t Catalog::allocateId(pkv::WriteBatch& batch) {
 }
 
 void Catalog::stageTable(const TableSchema& t, pkv::WriteBatch& batch) {
+  batch.put(kFormatKey, kFormatVersion);
   batch.put(schemaKey(t.name), serializeSchema(t));
   stageStats(t, batch);
 }
@@ -274,16 +356,56 @@ void Cursor::fill() {
   // for long scans.
   size_t chunk = chunk_;
   chunk_ = std::min(chunk_ * 4, kCursorChunk);
-  db_.scan(next_, "", [&](const std::string& k, const std::string& v) {
-    if (!hi_.empty() && k >= hi_) {
+  db_.scanRaw(next_, "", [&](const char* k, size_t kl, const char* v, size_t vl) {
+    if (!hi_.empty() && hi_.compare(0, hi_.size(), k, kl) <= 0) {
       done_ = true;
       return false;
     }
-    buf_.emplace_back(k, v);
+    buf_.emplace_back(std::string(k, kl), std::string(v, vl));
     return buf_.size() < chunk;
   });
   if (buf_.size() < chunk) done_ = true;  // the scan ran out of keys
   if (!buf_.empty()) next_ = buf_.back().first + '\0';  // smallest key after the last one
+}
+
+void RowCursor::fill() {
+  count_ = 0;
+  pos_ = 0;
+  if (done_) return;
+  size_t want = chunk_;
+  chunk_ = std::min<size_t>(chunk_ * 4, 1024);
+  // Bound the work per scan call (the scan holds PersistKV's tree lock),
+  // even when the filter rejects almost every row.
+  size_t scanned = 0, max_scan = std::max<size_t>(want * 8, 4096);
+  std::string last;
+  bool stopped_early = false;
+  db_.scanRaw(next_, "", [&](const char* k, size_t kl, const char* v, size_t vl) {
+    if (!hi_.empty() && hi_.compare(0, hi_.size(), k, kl) <= 0) {
+      done_ = true;
+      return false;
+    }
+    if (count_ == buf_.size()) buf_.emplace_back();
+    Row& row = buf_[count_];
+    decodeStoredRowInto(plan_, std::string_view(k, kl), std::string_view(v, vl), row);
+    if (!pred_ || isTrue(eval(*pred_, row))) count_++;
+    if (count_ >= want || ++scanned >= max_scan) {
+      last.assign(k, kl);
+      stopped_early = true;
+      return false;
+    }
+    return true;
+  });
+  if (stopped_early) next_ = last + '\0';  // resume right after the last key looked at
+  else done_ = true;                       // the scan reached the end of the store
+}
+
+bool RowCursor::next(Row* row) {
+  while (pos_ >= count_) {
+    if (done_) return false;
+    fill();
+  }
+  std::swap(*row, buf_[pos_++]);  // hand the row over; take the caller's old buffer back
+  return true;
 }
 
 bool Cursor::next(std::string* key, std::string* value) {

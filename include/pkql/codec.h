@@ -16,7 +16,8 @@ namespace pkql {
 //
 //   null   0x01
 //   false  0x02,  true 0x03
-//   int    0x04 + 8 bytes big-endian of (x XOR sign bit)
+//   int    tag 0x10..0x21 giving sign and length, then 0-8 big-endian bytes
+//          (negatives complemented), so small numbers take 1-2 bytes
 //   float  0x05 + 8 bytes big-endian of the IEEE bits, sign-adjusted
 //   text   0x06 + bytes, with 0x00 escaped as 0x00 0xFF, then 0x00 0x01
 void encodeKey(const Value& v, std::string& out);

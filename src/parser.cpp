@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <cstdlib>
 
 #include "pkql/ast.h"
@@ -164,13 +166,67 @@ class Parser {
     while (true) {
       while (peek().kind == Tok::Semi) p_++;
       if (peek().kind == Tok::End) break;
+      size_t start = p_;
       out.push_back(statement());
       if (peek().kind != Tok::Semi && peek().kind != Tok::End) fail("expected the end of the statement");
+      Statement& s = out.back();
+      if (s.kind == StmtKind::Query && !s.explain) fingerprint(s, start, p_);
     }
     return out;
   }
 
  private:
+  // A literal compared with == / != / in against a column can become a
+  // plan-cache parameter: the optimizer's estimate for `col == x` does not
+  // depend on x, so one plan serves every value. Range bounds and literals
+  // elsewhere stay part of the fingerprint, because their values do change
+  // plan choices.
+  void markParams(const ExprPtr& e, Statement& s, std::vector<int>& tokens) {
+    if (!e) return;
+    auto take = [&](const ExprPtr& lit) {
+      if (lit->kind != ExprKind::Literal || lit->value.isNull() || lit->token < 0) return;
+      lit->param = static_cast<int>(s.params.size());
+      s.params.push_back(lit->value);
+      tokens.push_back(lit->token);
+    };
+    if (e->kind == ExprKind::Binary && (e->op == Op::And || e->op == Op::Or)) {
+      markParams(e->args[0], s, tokens);
+      markParams(e->args[1], s, tokens);
+    } else if (e->kind == ExprKind::Unary && e->op == Op::Not) {
+      markParams(e->args[0], s, tokens);
+    } else if (e->kind == ExprKind::Binary && (e->op == Op::Eq || e->op == Op::Ne)) {
+      if (e->args[0]->kind == ExprKind::Column) take(e->args[1]);
+      else if (e->args[1]->kind == ExprKind::Column) take(e->args[0]);
+    } else if (e->kind == ExprKind::InList && e->args[0]->kind == ExprKind::Column) {
+      for (size_t i = 1; i < e->args.size(); i++) take(e->args[i]);
+    }
+  }
+
+  void markPipeline(const std::shared_ptr<Pipeline>& p, Statement& s, std::vector<int>& tokens) {
+    if (p->from.sub) markPipeline(p->from.sub, s, tokens);
+    for (Step& step : p->steps) {
+      if (step.kind == StepKind::Join && step.source.sub) markPipeline(step.source.sub, s, tokens);
+      if (step.kind == StepKind::Filter || step.kind == StepKind::Join) markParams(step.expr, s, tokens);
+    }
+  }
+
+  void fingerprint(Statement& s, size_t start, size_t end) {
+    std::vector<int> param_tokens;
+    markPipeline(s.pipeline, s, param_tokens);
+    std::string fp;
+    for (size_t i = start; i < end; i++) {
+      bool is_param = std::find(param_tokens.begin(), param_tokens.end(), static_cast<int>(i)) != param_tokens.end();
+      const Token& t = t_[i];
+      if (is_param) {
+        fp += t.kind == Tok::Int ? "?i" : t.kind == Tok::Float ? "?f" : t.kind == Tok::String ? "?s" : "?b";
+      } else {
+        fp += t.kind == Tok::String ? Value::text(t.text).literal() : t.text;
+      }
+      fp += '\x01';
+    }
+    s.fingerprint = std::move(fp);
+  }
+
   const Token& peek(size_t k = 0) const { return t_[std::min(p_ + k, t_.size() - 1)]; }
   const Token& take() { return t_[p_ < t_.size() - 1 ? p_++ : p_]; }
 
@@ -476,13 +532,25 @@ class Parser {
   ExprPtr unary() {
     if (acceptSym("-")) {
       ExprPtr a = unary();
-      if (a->kind == ExprKind::Literal && a->value.type() == Type::Int) return Expr::literal(Value::integer(-a->value.asInt()));
-      if (a->kind == ExprKind::Literal && a->value.type() == Type::Float) return Expr::literal(Value::real(-a->value.asFloat()));
+      ExprPtr neg;
+      if (a->kind == ExprKind::Literal && a->value.type() == Type::Int) neg = Expr::literal(Value::integer(-a->value.asInt()));
+      if (a->kind == ExprKind::Literal && a->value.type() == Type::Float) neg = Expr::literal(Value::real(-a->value.asFloat()));
+      if (neg) {
+        neg->token = a->token;
+        return neg;
+      }
       return Expr::unary(Op::Neg, a);
     }
     return primary();
   }
   ExprPtr primary() {
+    int tok = static_cast<int>(p_);
+    ExprPtr lit = primaryInner();
+    if (lit->kind == ExprKind::Literal) lit->token = tok;
+    return lit;
+  }
+
+  ExprPtr primaryInner() {
     const Token& t = peek();
     switch (t.kind) {
       case Tok::Int: {

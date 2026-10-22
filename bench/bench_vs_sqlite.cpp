@@ -1,5 +1,6 @@
 // Benchmark: PKQL on PersistKV vs SQLite, same data, same indexes, same
-// cache size, the same query written in each language.
+// cache size, the same query written in each language. Runs alternate between
+// the two engines and the median of 9 is reported.
 //
 //   bench_vs_sqlite [scale] [dir]     scale 1 = 50K users, 500K orders
 
@@ -67,16 +68,27 @@ void sqlLoad(sqlite3* db, const std::string& table, const std::vector<Row>& rows
   sqlite3_finalize(st);
 }
 
-double medianMs(int reps, const std::function<void()>& fn) {
-  fn();  // warm up caches
-  std::vector<double> t;
-  for (int i = 0; i < reps; i++) {
-    auto t0 = Clock::now();
-    fn();
-    t.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-  }
+double median(std::vector<double> t) {
   std::sort(t.begin(), t.end());
   return t[t.size() / 2];
+}
+
+// Times two workloads alternately (a, b, a, b, ...) after a warm-up, so
+// both see the same machine state (caches, CPU frequency, background load),
+// and returns the median of each.
+std::pair<double, double> interleavedMedians(int reps, const std::function<void()>& a, const std::function<void()>& b) {
+  a();
+  b();
+  std::vector<double> ta, tb;
+  for (int i = 0; i < reps; i++) {
+    auto t0 = Clock::now();
+    a();
+    ta.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+    t0 = Clock::now();
+    b();
+    tb.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+  }
+  return {median(ta), median(tb)};
 }
 
 std::string planSummary(Engine& pk, const std::string& q) {
@@ -248,15 +260,17 @@ int main(int argc, char** argv) {
   std::printf("| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite | PKQL plan |\n|---|---|---|---|---|\n");
   for (const Q& q : qs) {
     size_t pk_rows = 0, sq_rows = 0;
-    int reps = q.repeat > 1 ? 3 : 5;
-    double pk_ms = medianMs(reps, [&] {
-      pk_rows = 0;
-      for (int i = 0; i < q.repeat; i++) pk_rows += pk.run(q.pkql(i)).back().rows.size();
-    });
-    double sq_ms = medianMs(reps, [&] {
-      sq_rows = 0;
-      for (int i = 0; i < q.repeat; i++) sq_rows += sqlRows(sq, q.sql(i));
-    });
+    auto t = interleavedMedians(
+        9,
+        [&] {
+          pk_rows = 0;
+          for (int i = 0; i < q.repeat; i++) pk_rows += pk.run(q.pkql(i)).back().rows.size();
+        },
+        [&] {
+          sq_rows = 0;
+          for (int i = 0; i < q.repeat; i++) sq_rows += sqlRows(sq, q.sql(i));
+        });
+    double pk_ms = t.first, sq_ms = t.second;
     std::printf("| %s | %.1f | %.1f | %.2fx | %s |%s\n", q.name, pk_ms, sq_ms, pk_ms / sq_ms,
                 planSummary(pk, q.pkql(0)).c_str(), pk_rows == sq_rows ? "" : "  <-- ROW COUNT MISMATCH");
     std::fflush(stdout);

@@ -299,7 +299,9 @@ TEST(access_path_selection) {
   // Half the table matches: reading it in full is cheaper than 10,000 index lookups.
   CHECK(has(plan(db, "from orders | filter created > 500000"), "TableScan orders (full)"));
   CHECK(has(plan(db, "from orders | filter created > 999000"), "IndexScan orders.orders_created"));
-  CHECK(has(plan(db, "from users | filter city == \"Pune\" and age > 70"), "IndexScan users.users_city"));
+  // 1 city in 8 is 12.5% of users: fetching each match by key costs more
+  // than reading the table once, so a full scan wins (measured, see README).
+  CHECK(has(plan(db, "from users | filter city == \"Pune\""), "TableScan users (full)"));
 }
 
 // Estimated rows of the plan's root, parsed from explain output.
@@ -340,7 +342,11 @@ TEST(filters_move_below_joins_and_groups) {
   Engine db(freshDir("pushdown"), fast());
   loadShop(db, 500);
   std::string p = plan(db, "from orders | join users on orders.user_id == users.id | filter users.city == \"Pune\"");
-  CHECK(has(p, "IndexScan users.users_city [city == \"Pune\"]"));
+  // The filter runs at the users scan (as an index range or a scan filter),
+  // not above the join.
+  CHECK(has(p, "TableScan users (full) filter users.city == \"Pune\"") ||
+        has(p, "IndexScan users.users_city [city == \"Pune\"]"));
+  CHECK(!has(p, "Filter users.city"));
   // A filter on a grouping key runs before grouping.
   p = plan(db, "from orders | group user_id { total = sum(amount) } | filter user_id == 7");
   CHECK(has(p, "IndexScan orders.orders_user [user_id == 7]"));
@@ -384,6 +390,54 @@ TEST(all_planner_settings_agree) {
       else CHECK(r.rows == baseline);
     }
   }
+}
+
+TEST(plan_cache_reuses_plans_across_values_and_stays_correct) {
+  Engine db(freshDir("plan_cache"), fast());
+  loadShop(db, 300);
+  const char* shapes[] = {
+      "from orders | filter user_id == %d | aggregate { s = sum(amount), n = count() }",
+      "from orders | filter id == %d | select amount",
+      "from orders | join users on orders.user_id == users.id | filter users.id == %d and orders.status != \"open\" "
+      "| aggregate { n = count() }",
+      "from users | filter id in [%d, 7, 11] | aggregate { n = count() }",
+  };
+  for (const char* shape : shapes) {
+    for (int v = 0; v < 40; v++) {
+      char q[512];
+      std::snprintf(q, sizeof q, shape, v * 13 % 400);
+      db.setPlanCache(false);
+      Result fresh = one(db, q);
+      db.setPlanCache(true);
+      // Warm the cache with a different value first, then run this one.
+      char warm[512];
+      std::snprintf(warm, sizeof warm, shape, (v * 13 + 5) % 400);
+      one(db, warm);
+      Result cached = one(db, q);
+      CHECK(cached.rows == fresh.rows);
+    }
+  }
+  uint64_t hits = db.planCacheHits();
+  for (int i = 0; i < 50; i++) one(db, "from orders | filter user_id == " + std::to_string(i) + " | select id");
+  CHECK(db.planCacheHits() >= hits + 49);  // one miss, then hits
+
+  // A new index invalidates cached plans.
+  db.run("table t (id: int key, k: int)");
+  std::vector<Row> rows;
+  for (int i = 0; i < 3000; i++) rows.push_back({Value::integer(i), Value::integer(i % 300)});
+  db.insertRows("t", rows);
+  db.run("analyze t");
+  one(db, "from t | filter k == 5 | select id");
+  db.run("index t_k on t (k)");
+  CHECK(has(plan(db, "from t | filter k == 9 | select id"), "IndexScan t.t_k"));
+  CHECK(one(db, "from t | filter k == 9 | select id").rows.size() == 10);
+
+  // Range literals are part of the cache key: different plans for different bounds.
+  CHECK(has(plan(db, "from orders | filter created > 999000"), "IndexScan"));
+  one(db, "from orders | filter created > 999000 | select id");
+  Result wide = one(db, "from orders | filter created > 10 | aggregate { n = count() }");
+  db.setPlanCache(false);
+  CHECK(one(db, "from orders | filter created > 10 | aggregate { n = count() }").rows == wide.rows);
 }
 
 TEST(explain_analyze_reports_actual_rows) {

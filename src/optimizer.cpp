@@ -14,11 +14,12 @@ namespace pkql {
 namespace {
 
 // Cost units are "work to read and decode one row sequentially". The other
-// constants are relative to that; they were picked to match the storage
-// engine's behavior (a random lookup descends the B+Tree: about 4 rows' work).
+// constants are relative to that and were calibrated by measurement on a
+// warm cache (see README): a sequential row costs about 140 ns, a random
+// primary-key lookup about 1.4 us, so one lookup is worth about 10 rows.
 constexpr double kSeqRow = 1.0;
-constexpr double kLookup = 4.0;
-constexpr double kIndexEntry = 0.6;
+constexpr double kLookup = 10.0;
+constexpr double kIndexEntry = 0.7;
 constexpr double kPred = 0.05;
 constexpr double kHashBuild = 1.5;
 constexpr double kHashProbe = 1.0;
@@ -194,6 +195,7 @@ struct Bound {  // column op literal, normalized so the column is on the left
   int col = -1;
   Op op = Op::Eq;
   Value value;
+  int param = -1;  // plan-cache parameter slot of the literal
 };
 
 Op flip(Op op) {
@@ -215,11 +217,11 @@ bool asBound(const Expr& e, Bound* b) {
   const Expr& l = *e.args[0];
   const Expr& r = *e.args[1];
   if (l.kind == ExprKind::Column && r.kind == ExprKind::Literal) {
-    *b = {l.index, e.op, r.value};
+    *b = {l.index, e.op, r.value, r.param};
     return true;
   }
   if (r.kind == ExprKind::Column && l.kind == ExprKind::Literal) {
-    *b = {r.index, flip(e.op), l.value};
+    *b = {r.index, flip(e.op), l.value, l.param};
     return true;
   }
   return false;
@@ -412,6 +414,7 @@ KeyMatch matchKey(const std::vector<int>& key_cols, const TableSchema& t, const 
       if (m.used[i] || !asBound(*conjs[i], &b) || b.col != kc || b.op != Op::Eq) continue;
       if (!keyLiteral(type, &b.value)) continue;
       m.eq.push_back(Expr::literal(b.value));
+      m.eq.back()->param = b.param;
       m.used[i] = true;
       found_eq = true;
     }

@@ -58,8 +58,9 @@ struct TableSchema {
 // ---------------------------------------------------------------------------
 // Key layout in PersistKV
 //
-//   r <table id u32 BE> <encoded pk columns>          -> encoded non-key columns
-//   x <index id u32 BE> <encoded index cols> <pk>     -> (empty)
+//   r <table id> <encoded pk columns>                 -> encoded non-key columns
+//   x <index id> <encoded index cols> <pk>            -> (empty)
+//   (ids are 1 byte below 128, see putId in storage.cpp)
 //   m t <table name>                                  -> table schema
 //   m s <table id u32 BE>                             -> table statistics
 //   m n                                               -> next id
@@ -78,6 +79,26 @@ std::string indexKey(const TableSchema& t, const IndexSchema& ix, const Row& row
 // the query never reads; they come back as null.
 Row decodeStoredRow(const TableSchema& t, std::string_view key, std::string_view payload,
                     const std::vector<bool>* needed = nullptr);
+// Same, decoding into `out` and reusing its storage (no allocation once warm).
+void decodeStoredRowInto(const TableSchema& t, std::string_view key, std::string_view payload,
+                         const std::vector<bool>* needed, Row& out);
+
+// What to decode for a given set of needed columns, worked out once per scan:
+// decoding stops after the last needed key column and the last needed
+// payload column, so unread trailing columns are never even parsed.
+struct DecodePlan {
+  size_t ncols = 0;
+  std::vector<int> key_cols;      // table column of each primary-key part, in key order
+  std::vector<bool> key_needed;
+  size_t key_parts = 0;           // decode this many key parts
+  std::vector<int> payload_cols;  // table column of each payload value, in order
+  std::vector<bool> payload_needed;
+  size_t payload_parts = 0;       // decode this many payload values
+
+  DecodePlan(const TableSchema& t, const std::vector<bool>* needed);
+};
+
+void decodeStoredRowInto(const DecodePlan& plan, std::string_view key, std::string_view payload, Row& out);
 // The primary key tail of an index entry, turned back into a row key.
 std::string rowKeyFromIndexEntry(const TableSchema& t, const IndexSchema& ix, std::string_view entry);
 
@@ -130,6 +151,39 @@ class Cursor {
   std::vector<std::pair<std::string, std::string>> buf_;
   size_t pos_ = 0;
   size_t chunk_ = 16;  // grows to kCursorChunk
+  bool done_ = false;
+};
+
+// ---------------------------------------------------------------------------
+// RowCursor: table rows in key range [lo, hi), decoded and filtered inside
+// PersistKV's zero-copy scan callback. Only rows that pass `pred` are copied
+// out, and only the `needed` columns are decoded.
+// ---------------------------------------------------------------------------
+
+struct Expr;
+
+class RowCursor {
+ public:
+  RowCursor(pkv::DB& db, const TableSchema& t, std::string lo, std::string hi_exclusive,
+            const std::vector<bool>* needed, const Expr* pred)
+      : db_(db), t_(t), next_(std::move(lo)), hi_(std::move(hi_exclusive)), needed_(needed), pred_(pred),
+        plan_(t, needed) {}
+
+  bool next(Row* row);
+
+ private:
+  void fill();
+
+  pkv::DB& db_;
+  const TableSchema& t_;
+  std::string next_, hi_;
+  const std::vector<bool>* needed_;
+  const Expr* pred_;
+  DecodePlan plan_;
+  std::vector<Row> buf_;  // reused across fills: rows are swapped, not reallocated
+  size_t count_ = 0;      // valid rows in buf_
+  size_t pos_ = 0;
+  size_t chunk_ = 16;  // rows per fill; grows for long scans
   bool done_ = false;
 };
 

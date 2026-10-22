@@ -32,6 +32,8 @@ struct Expr {
   std::vector<ExprPtr> args;  // operands; InList: args[0] is the tested value
   Type type = Type::Null;     // result type (bound)
   bool nullable = true;       // can evaluate to null (bound)
+  int param = -1;             // Literal: plan-cache parameter slot (-1 = baked into the plan)
+  int token = -1;             // Literal: index of its token in the source, for fingerprints
 
   static ExprPtr literal(Value v);
   static ExprPtr column(std::string qualifier, std::string name);

@@ -3,6 +3,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "persistkv/db.h"
@@ -38,6 +39,15 @@ class Engine {
   std::string checkIntegrity();
 
   PlannerOptions& plannerOptions() { return planner_; }
+
+  // Plan cache for queries: plans are reused across literal values of
+  // `col == x` / `col in [...]` predicates.
+  void setPlanCache(bool on) {
+    plan_cache_on_ = on;
+    plan_cache_.clear();
+  }
+  uint64_t planCacheHits() const { return cache_hits_; }
+  uint64_t planCacheMisses() const { return cache_misses_; }
   Catalog& catalog() { return catalog_; }
   pkv::DB& db() { return db_; }
 
@@ -58,8 +68,20 @@ class Engine {
   Row checkRow(const TableSchema& t, Row row);
   void analyzeTable(TableSchema& t);
 
+  struct CachedPlan {
+    PPtr plan;
+    Schema columns;
+    uint64_t version = 0;
+    std::vector<std::pair<const TableSchema*, uint64_t>> rows_when_planned;
+  };
+  bool cacheValid(const CachedPlan& c) const;
+
   pkv::DB db_;
   Catalog catalog_;
+  std::unordered_map<std::string, CachedPlan> plan_cache_;
+  bool plan_cache_on_ = true;
+  uint64_t catalog_version_ = 0;  // bumped by DDL, analyze and let: cached plans go stale
+  uint64_t cache_hits_ = 0, cache_misses_ = 0;
   Lets lets_;
   PlannerOptions planner_;
   std::mutex mu_;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <set>
 #include <unordered_set>
@@ -100,6 +101,10 @@ std::vector<Result> Engine::run(std::string_view script) {
 
 Result Engine::execute(const Statement& s) {
   std::lock_guard<std::mutex> lock(mu_);
+  if (s.kind != StmtKind::Query && s.kind != StmtKind::Insert && s.kind != StmtKind::ShowTables &&
+      s.kind != StmtKind::Describe) {
+    catalog_version_++;  // schema, statistics or let definitions may change
+  }
   switch (s.kind) {
     case StmtKind::CreateTable: return createTable(s);
     case StmtKind::CreateIndex: return createIndex(s);
@@ -321,14 +326,86 @@ void Engine::insertRows(const std::string& name, const std::vector<Row>& rows) {
 // Queries, updates and deletes
 // ---------------------------------------------------------------------------
 
+namespace {
+
+void collectTables(const PNode& p, std::vector<const TableSchema*>& out) {
+  if (p.table) out.push_back(p.table);
+  for (const PPtr& k : p.kids) collectTables(*k, out);
+}
+
+void patchExpr(const ExprPtr& e, const std::vector<Value>& params) {
+  if (!e) return;
+  if (e->kind == ExprKind::Literal && e->param >= 0 && e->param < static_cast<int>(params.size())) {
+    Value v = params[e->param];
+    if (e->value.type() == Type::Float && v.type() == Type::Int) v = v.castTo(Type::Float);
+    e->value = std::move(v);
+  }
+  for (const ExprPtr& a : e->args) patchExpr(a, params);
+}
+
+// Puts this execution's literal values into a cached plan.
+void patchPlan(PNode& p, const std::vector<Value>& params) {
+  for (const ExprPtr& e : p.eq) patchExpr(e, params);
+  patchExpr(p.lo, params);
+  patchExpr(p.hi, params);
+  patchExpr(p.pred, params);
+  for (const ExprPtr& e : p.left_keys) patchExpr(e, params);
+  for (const ExprPtr& e : p.right_keys) patchExpr(e, params);
+  for (const ExprPtr& e : p.exprs) patchExpr(e, params);
+  for (const AggSpec& a : p.aggs) patchExpr(a.arg, params);
+  for (const SortSpec& s : p.sort) patchExpr(s.expr, params);
+  for (const PPtr& k : p.kids) patchPlan(*k, params);
+}
+
+}  // namespace
+
+bool Engine::cacheValid(const CachedPlan& c) const {
+  if (c.version != catalog_version_) return false;
+  // Re-plan when a table grew or shrank a lot since the plan was made.
+  for (const auto& tr : c.rows_when_planned) {
+    double now = static_cast<double>(tr.first->stats.rows), then = static_cast<double>(tr.second);
+    if (std::abs(now - then) > 64 && (now > 2 * then || now < then / 2)) return false;
+  }
+  return true;
+}
+
 Result Engine::query(const Statement& s) {
   const Pipeline& p = *s.pipeline;
   if (!p.steps.empty() && (p.steps.back().kind == StepKind::Delete || p.steps.back().kind == StepKind::Update)) {
     if (s.explain) throw Error("explain works on queries, not on update or delete");
     return modify(s, p);
   }
-  LPtr logical = buildLogicalPlan(p, catalog_, lets_);
-  PPtr plan = optimize(logical, planner_);
+  PPtr plan;
+  Schema columns;
+  std::string key;
+  if (plan_cache_on_ && !s.explain && !s.fingerprint.empty()) {
+    key = s.fingerprint + std::to_string(planner_.reorder_joins) + std::to_string(planner_.use_indexes) +
+          std::to_string(planner_.use_interesting_orders);
+    auto it = plan_cache_.find(key);
+    if (it != plan_cache_.end() && cacheValid(it->second)) {
+      plan = it->second.plan;
+      columns = it->second.columns;
+      patchPlan(*plan, s.params);
+      cache_hits_++;
+    }
+  }
+  if (!plan) {
+    LPtr logical = buildLogicalPlan(p, catalog_, lets_);
+    plan = optimize(logical, planner_);
+    columns = logical->schema;
+    if (!key.empty()) {
+      cache_misses_++;
+      if (plan_cache_.size() >= 1024) plan_cache_.clear();
+      CachedPlan c;
+      c.plan = plan;
+      c.columns = columns;
+      c.version = catalog_version_;
+      std::vector<const TableSchema*> tables;
+      collectTables(*plan, tables);
+      for (const TableSchema* t : tables) c.rows_when_planned.push_back({t, t->stats.rows});
+      plan_cache_[key] = std::move(c);
+    }
+  }
 
   Result r;
   if (s.explain && !s.explain_analyze) {
@@ -343,7 +420,7 @@ Result Engine::query(const Statement& s) {
     r.message = explainPlan(*plan, true) + plural(rows.size(), "row") + " in " + fmtMs(ms);
     return r;
   }
-  r.columns = logical->schema;
+  r.columns = columns;
   r.rows = std::move(rows);
   r.has_rows = true;
   r.message = fmtMs(ms);

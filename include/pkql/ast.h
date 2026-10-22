@@ -74,6 +74,11 @@ struct Statement {
   std::shared_ptr<Pipeline> pipeline;
   bool explain = false;
   bool explain_analyze = false;
+
+  // Plan cache: the statement's tokens with parameterizable literals
+  // replaced by placeholders, and the values of those literals.
+  std::string fingerprint;
+  std::vector<Value> params;
 };
 
 // Parses a script of one or more statements, separated by `;` or by line

@@ -32,7 +32,8 @@ struct Tab {
   std::vector<Col> cols;
 };
 
-std::mt19937 rng;
+std::mt19937 rng;   // query shape
+std::mt19937 lrng;  // literal values, so one shape can be re-run with other constants
 
 int pick(int n) { return static_cast<int>(rng() % static_cast<unsigned>(n)); }
 
@@ -209,7 +210,7 @@ struct Pred {
 
 Pred atom(const std::vector<Ref>& refs) {
   const Ref& r = refs[pick(static_cast<int>(refs.size()))];
-  const Value& v = r.col->domain[pick(static_cast<int>(r.col->domain.size()))];
+  const Value& v = r.col->domain[lrng() % r.col->domain.size()];
   if (r.col->type == Type::Text) {
     int k = pick(4);
     if (k == 0) {
@@ -218,7 +219,7 @@ Pred atom(const std::vector<Ref>& refs) {
               "substr(" + r.q() + ", 1, " + std::to_string(p.size()) + ") = " + sqlLiteral(Value::text(p))};
     }
     if (k == 1) {
-      const Value& w = r.col->domain[pick(static_cast<int>(r.col->domain.size()))];
+      const Value& w = r.col->domain[lrng() % r.col->domain.size()];
       return {r.q() + " in [" + v.literal() + ", " + w.literal() + "]",
               r.q() + " in (" + sqlLiteral(v) + ", " + sqlLiteral(w) + ")"};
     }
@@ -341,6 +342,8 @@ int main(int argc, char** argv) {
   int queries = argc > 1 ? std::atoi(argv[1]) : 400;
   unsigned seed = argc > 2 ? static_cast<unsigned>(std::strtoul(argv[2], nullptr, 10)) : 12345;
   rng.seed(seed);
+  std::mt19937 master(seed);
+  unsigned shape_seed = 0;
 
   pkv::makeDir("test_data");
   std::string dir = "test_data/differential";
@@ -368,6 +371,11 @@ int main(int argc, char** argv) {
 
   int failures = 0, empty = 0;
   for (int i = 0; i < queries; i++) {
+    // Every shape runs twice with different constants: the second run reuses
+    // the first run's cached plan with its own parameter values.
+    if (i % 2 == 0) shape_seed = master();
+    rng.seed(shape_seed);
+    lrng.seed(shape_seed + 1000003u * static_cast<unsigned>(i % 2));
     Query q = generate(tabs);
     NormRows expected = runSqlite(sq, q.sql);
     if (!q.ordered) std::sort(expected.begin(), expected.end());
@@ -395,6 +403,7 @@ int main(int argc, char** argv) {
   }
   sqlite3_close(sq);
   std::cout << "[" << (failures == 0 ? "PASS" : "FAIL") << "] " << queries << " random queries x 3 planner configs vs SQLite, "
-            << failures << " mismatches (" << empty << " queries had empty results)\n";
+            << failures << " mismatches (" << empty << " queries had empty results; plan cache: " << pk.planCacheHits()
+            << " hits, " << pk.planCacheMisses() << " misses)\n";
   return failures == 0 ? 0 : 1;
 }

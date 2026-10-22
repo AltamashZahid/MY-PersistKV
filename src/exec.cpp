@@ -62,9 +62,13 @@ class KeyReader {
  public:
   KeyReader(pkv::DB& db, const PNode& p) : db_(db), p_(p) {}
 
-  void start(const std::vector<Value>& eq, const Row& ctx_row) {
+  // `pred`, if given, is the scan's residual filter: rows that fail it are
+  // dropped inside the storage scan without being copied out.
+  void start(const std::vector<Value>& eq, const Row& ctx_row, const Expr* pred = nullptr) {
     done_ = false;
     cursor_.reset();
+    rows_.reset();
+    pred_ = pred;
     const std::vector<int>& cols = p_.index ? p_.index->cols : p_.table->pk;
     if (p_.point && !p_.index && eq.size() == cols.size()) {
       point_key_ = tablePrefix(p_.table->id);
@@ -75,7 +79,8 @@ class KeyReader {
     point_pending_ = false;
     std::string lo, hi;
     keyRange(p_.index ? indexPrefix(p_.index->id) : tablePrefix(p_.table->id), eq, p_, ctx_row, &lo, &hi);
-    cursor_ = std::make_unique<Cursor>(db_, lo, hi);
+    if (p_.index) cursor_ = std::make_unique<Cursor>(db_, lo, hi);
+    else rows_ = std::make_unique<RowCursor>(db_, *p_.table, lo, hi, needed(), pred);
   }
 
   bool next(Row* row) {
@@ -84,20 +89,17 @@ class KeyReader {
       std::string payload;
       if (point_key_.size() > pkv::kMaxKeySize || !db_.get(point_key_, &payload)) return false;
       *row = decodeStoredRow(*p_.table, point_key_, payload, needed());
-      return true;
+      return !pred_ || isTrue(eval(*pred_, *row));
     }
+    if (rows_) return rows_->next(row);
     if (!cursor_) return false;
     std::string key, value;
     while (cursor_->next(&key, &value)) {
-      if (!p_.index) {
-        *row = decodeStoredRow(*p_.table, key, value, needed());
-        return true;
-      }
       std::string rk = rowKeyFromIndexEntry(*p_.table, *p_.index, key);
       std::string payload;
       if (!db_.get(rk, &payload)) throw Error("index " + p_.index->name + " points at a missing row");
       *row = decodeStoredRow(*p_.table, rk, payload, needed());
-      return true;
+      if (!pred_ || isTrue(eval(*pred_, *row))) return true;
     }
     return false;
   }
@@ -107,7 +109,9 @@ class KeyReader {
 
   pkv::DB& db_;
   const PNode& p_;
-  std::unique_ptr<Cursor> cursor_;
+  std::unique_ptr<Cursor> cursor_;    // secondary-index entries
+  std::unique_ptr<RowCursor> rows_;  // primary-key range
+  const Expr* pred_ = nullptr;
   std::string point_key_;
   bool point_pending_ = false;
   bool done_ = false;
@@ -119,14 +123,9 @@ class ScanOp : public Operator {
   void open() override {
     const std::vector<int>& cols = node_.index ? node_.index->cols : node_.table->pk;
     std::vector<int> prefix(cols.begin(), cols.begin() + static_cast<long>(node_.eq.size()));
-    reader_.start(evalAll(node_.eq, Row(), node_.table, &prefix), Row());
+    reader_.start(evalAll(node_.eq, Row(), node_.table, &prefix), Row(), node_.pred.get());
   }
-  bool next(Row* row) override {
-    while (reader_.next(row)) {
-      if (!node_.pred || isTrue(eval(*node_.pred, *row))) return true;
-    }
-    return false;
-  }
+  bool next(Row* row) override { return reader_.next(row); }
 
  private:
   KeyReader reader_;
@@ -341,6 +340,16 @@ class HashAggregateOp : public Operator {
     kinds_.clear();
     for (const AggSpec& a : node_.aggs) kinds_.push_back(aggKind(a));
     Row r, key;
+    if (node_.exprs.empty()) {  // `aggregate`: a single group, no hash table needed
+      std::vector<AggState>& st = groups_[Row()];
+      st.resize(node_.aggs.size());
+      order_.push_back(Row());
+      while (child_->next(&r)) {
+        for (size_t i = 0; i < node_.aggs.size(); i++) update(kinds_[i], node_.aggs[i], st[i], r);
+      }
+      pos_ = 0;
+      return;
+    }
     while (child_->next(&r)) {
       key.clear();
       for (const ExprPtr& e : node_.exprs) key.push_back(eval(*e, r));
@@ -451,13 +460,17 @@ class SortOp : public Operator {
       size_t k = static_cast<size_t>(std::max<int64_t>(node_.limit, 0));
       auto cmp = [this](const SortRow& a, const SortRow& b) { return lessBy(node_.sort, a, b); };
       std::priority_queue<SortRow, std::vector<SortRow>, decltype(cmp)> heap(cmp);
+      SortRow probe;
       while (k > 0 && child_->next(&r)) {
-        SortRow s = makeSortRow(node_.sort, r);
+        probe.keys.clear();
+        for (const SortSpec& spec : node_.sort) probe.keys.push_back(eval(*spec.expr, r));
         if (heap.size() < k) {
-          heap.push(std::move(s));
-        } else if (lessBy(node_.sort, s, heap.top())) {
+          probe.row = r;
+          heap.push(probe);
+        } else if (lessBy(node_.sort, probe, heap.top())) {  // only winners copy their row
+          probe.row = r;
           heap.pop();
-          heap.push(std::move(s));
+          heap.push(probe);
         }
       }
       while (!heap.empty()) {
