@@ -187,6 +187,13 @@ void parseKey(std::string_view& in, Sink& out) {
       return;
     }
     case kText: {
+      // Fast path: no escaped zero byte, so the text is one run of bytes.
+      size_t end = in.find('\0');
+      if (end != std::string_view::npos && end + 1 < in.size() && in[end + 1] == '\x01') {
+        if (out.active()) out.text(in.data(), end);
+        in.remove_prefix(end + 2);
+        return;
+      }
       std::string s;
       while (true) {
         if (in.empty()) throw Error("corrupt key: unterminated text");

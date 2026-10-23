@@ -91,24 +91,23 @@ class KeyReader {
       rows_ = std::make_unique<RowCursor>(db_, *p_.table, lo, hi, needed(), pred);
       return;
     }
-    cursor_ = std::make_unique<Cursor>(db_, lo, hi);
     // A sorted fetch returns rows in primary-key order, so it is only used
     // when nothing above relies on the index's order.
-    if (p_.kind == PKind::IndexScan && !p_.order_needed) startSortedFetchIfCheaper();
+    if (p_.kind == PKind::IndexScan && !p_.order_needed) {
+      startSortedFetchIfCheaper(std::move(lo), hi);
+      return;
+    }
+    cursor_ = std::make_unique<Cursor>(db_, lo, hi);
   }
 
   // Sorted index fetch (like a bitmap heap scan): when an index scan matches
   // many rows, collect their keys, sort them, and read the table once in key
   // order, decoding only those rows, instead of one random lookup per row.
   // Chosen when matches x lookup cost exceeds one pass over the table.
-  void startSortedFetchIfCheaper() {
+  void startSortedFetchIfCheaper(std::string index_lo, const std::string& index_hi) {
     std::vector<std::string> keys;
-    std::string k, v;
+    collectRowKeys(db_, *p_.table, *p_.index, std::move(index_lo), index_hi, &keys);
     double table_rows = static_cast<double>(p_.table->stats.rows);
-    while (cursor_->next(&k, &v)) {
-      keys.push_back(rowKeyFromIndexEntry(*p_.table, *p_.index, k));
-    }
-    cursor_.reset();
     if (static_cast<double>(keys.size()) * kLookupVsSkip < table_rows) {
       pending_keys_ = std::move(keys);  // few matches: look each one up
       pending_pos_ = 0;

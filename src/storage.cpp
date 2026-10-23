@@ -284,6 +284,32 @@ std::string rowKeyFromIndexEntry(const TableSchema& t, const IndexSchema& ix, st
   return tablePrefix(t.id) + std::string(entry);
 }
 
+void collectRowKeys(pkv::DB& db, const TableSchema& t, const IndexSchema& ix, std::string lo, const std::string& hi,
+                    std::vector<std::string>* out) {
+  const std::string table_prefix = tablePrefix(t.id);
+  constexpr size_t kChunk = 4096;
+  while (true) {
+    size_t n = 0;
+    bool more = false;
+    std::string last;
+    db.scanRaw(lo, "", [&](const char* k, size_t kl, const char*, size_t) {
+      if (!hi.empty() && hi.compare(0, hi.size(), k, kl) <= 0) return false;
+      std::string_view entry(k, kl);
+      entry.remove_prefix(prefixLength(entry));  // 'x' + index id
+      for (size_t i = 0; i < ix.cols.size(); i++) decodeKeyInto(entry, nullptr);  // skip the indexed columns
+      std::string& rk = out->emplace_back();
+      rk.reserve(table_prefix.size() + entry.size());
+      rk.append(table_prefix).append(entry);
+      if (++n < kChunk) return true;
+      last.assign(k, kl);
+      more = true;
+      return false;
+    });
+    if (!more) return;
+    lo = last + '\0';  // smallest key after the last one
+  }
+}
+
 // ---------------------------------------------------------------------------
 
 void Catalog::load() {

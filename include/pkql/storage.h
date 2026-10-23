@@ -102,6 +102,12 @@ void decodeStoredRowInto(const DecodePlan& plan, std::string_view key, std::stri
 // The primary key tail of an index entry, turned back into a row key.
 std::string rowKeyFromIndexEntry(const TableSchema& t, const IndexSchema& ix, std::string_view entry);
 
+// Appends the row key of every index entry in [lo, hi) to *out, reading the
+// entries in place (no per-entry copies). The scan runs in bounded chunks so
+// the store's tree lock is never held for long.
+void collectRowKeys(pkv::DB& db, const TableSchema& t, const IndexSchema& ix, std::string lo, const std::string& hi,
+                    std::vector<std::string>* out);
+
 // ---------------------------------------------------------------------------
 // Catalog: the table schemas, persisted in the same store as the data.
 // ---------------------------------------------------------------------------
