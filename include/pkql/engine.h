@@ -8,6 +8,7 @@
 
 #include "persistkv/db.h"
 #include "pkql/ast.h"
+#include "pkql/colstore.h"
 #include "pkql/exec.h"
 #include "pkql/plan.h"
 #include "pkql/storage.h"
@@ -66,7 +67,9 @@ class Engine {
   Result describe(const Statement& s);
 
   TableSchema& table(const std::string& name);
-  void stageInsert(TableSchema& t, const std::vector<const Row*>& rows, pkv::WriteBatch& batch);
+  void stageInsert(TableSchema& t, const std::vector<const Row*>& rows, pkv::WriteBatch& batch, BlockDrops& drops);
+  // Encodes complete runs of rows not yet in column blocks into new blocks.
+  void buildBlocks(TableSchema& t);
   Row checkRow(const TableSchema& t, Row row);
   bool rowFits(const TableSchema& t, const Row& row) const;
   void analyzeTable(TableSchema& t);

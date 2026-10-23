@@ -12,6 +12,8 @@
 
 namespace pkql {
 
+struct ColumnBlocks;
+
 // ---------------------------------------------------------------------------
 // Schema and statistics
 // ---------------------------------------------------------------------------
@@ -54,6 +56,8 @@ struct TableSchema {
   // Per column: the dictionary of a non-key text column, else null. Shared,
   // so copies of the schema see the same dictionary.
   std::vector<std::shared_ptr<TextDict>> dicts;
+  // Column blocks (colstore.h) of a time-keyed table, else null; shared like dicts.
+  std::shared_ptr<ColumnBlocks> blocks;
 
   int colIndex(const std::string& col) const;  // -1 if absent
   bool isPkColumn(int col) const;
@@ -88,6 +92,8 @@ class DictTxn {
 //   m s <table id u32 BE>                             -> table statistics
 //   m n                                               -> next id
 //   m k <table id u32 BE> <column u16 BE> <code u32 BE> -> text (dictionary)
+//   c <table id> <encoded first pk>                   -> column block (colstore.h)
+//   m b <table id u32 BE> <encoded first pk>          -> its metadata
 //
 // Because the encoding is order-preserving, a table's rows are stored in
 // primary-key order and an index's entries in index-column order.

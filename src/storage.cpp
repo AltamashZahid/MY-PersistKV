@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "pkql/codec.h"
+#include "pkql/colstore.h"
 #include "pkql/expr.h"
 
 namespace pkql {
@@ -45,6 +46,11 @@ std::string dictKey(uint32_t table_id, int col, uint32_t code) {
   k += static_cast<char>(col & 0xFF);
   putU32(code, k);
   return k;
+}
+
+// Column blocks for time-keyed tables.
+void attachBlocks(TableSchema& t) {
+  if (!t.blocks && blocksEligible(t)) t.blocks = std::make_shared<ColumnBlocks>();
 }
 
 // A dictionary for each non-key text column.
@@ -406,6 +412,18 @@ void Catalog::load() {
       d->values.push_back(val);
       return true;
     });
+    attachBlocks(*t);
+    if (t->blocks) {
+      std::string bprefix = blockMetaPrefix(t->id);
+      db_.scan(bprefix, "", [&](const std::string& k, const std::string& val) {
+        if (k.compare(0, bprefix.size(), bprefix) != 0) return false;
+        BlockMeta m = deserializeBlockMeta(val, firstRowKeyFromMetaKey(*t, k));
+        t->blocks->covered_rows += m.rows;
+        std::string first = m.first_key;
+        t->blocks->by_first.emplace(std::move(first), std::move(m));
+        return true;
+      });
+    }
     std::string name = t->name;
     tables_[name] = std::move(t);
   }
@@ -441,6 +459,12 @@ void Catalog::stageDrop(const TableSchema& t, pkv::WriteBatch& batch) {
       batch.remove(dictKey(t.id, static_cast<int>(c), static_cast<uint32_t>(code)));
     }
   }
+  if (t.blocks) {
+    for (const auto& b : t.blocks->by_first) {
+      batch.remove(blockKey(t, b.first));
+      batch.remove(blockMetaKey(t, b.first));
+    }
+  }
 }
 
 DictTxn::DictTxn(const TableSchema& t) : t_(t) {
@@ -466,6 +490,7 @@ void DictTxn::stage(pkv::WriteBatch& batch) const {
 
 void Catalog::install(std::unique_ptr<TableSchema> t) {
   attachDicts(*t);
+  attachBlocks(*t);
   std::string name = t->name;
   tables_[name] = std::move(t);
 }

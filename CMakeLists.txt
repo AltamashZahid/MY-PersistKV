@@ -42,7 +42,8 @@ add_library(pkql STATIC
   src/planner.cpp
   src/storage.cpp
   src/value.cpp
-  src/vector.cpp)
+  src/vector.cpp
+  src/colstore.cpp)
 target_include_directories(pkql PUBLIC include)
 target_link_libraries(pkql PUBLIC persistkv)
 

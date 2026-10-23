@@ -361,7 +361,7 @@ Row Engine::checkRow(const TableSchema& t, Row row) {
   return row;
 }
 
-void Engine::stageInsert(TableSchema& t, const std::vector<const Row*>& rows, pkv::WriteBatch& batch) {
+void Engine::stageInsert(TableSchema& t, const std::vector<const Row*>& rows, pkv::WriteBatch& batch, BlockDrops& drops) {
   std::vector<std::string> keys(rows.size());
   for (size_t i = 0; i < rows.size(); i++) keys[i] = rowKey(t, *rows[i]);
 
@@ -387,6 +387,14 @@ void Engine::stageInsert(TableSchema& t, const std::vector<const Row*>& rows, pk
   if (existing) throw duplicate(*existing);
 
   batch.reserve(rows.size() * (1 + t.indexes.size()));
+  // A new row inside a block's key range makes the block incomplete. Appends
+  // (keys past the last block) skip the lookup.
+  if (t.blocks && !t.blocks->by_first.empty()) {
+    const std::string& last = std::prev(t.blocks->by_first.end())->second.last_key;
+    for (const std::string& k : keys) {
+      if (k <= last) drops.touch(k, batch);
+    }
+  }
   for (size_t i = 0; i < rows.size(); i++) {
     batch.put(std::move(keys[i]), rowPayload(t, *rows[i]));
     for (const IndexSchema& ix : t.indexes) batch.put(indexKey(t, ix, *rows[i]), std::string());
@@ -415,14 +423,17 @@ Result Engine::insert(const Statement& s) {
   std::vector<const Row*> ptrs;
   for (const Row& r : rows) ptrs.push_back(&r);
   DictTxn dicts(t);
-  stageInsert(t, ptrs, batch);
+  BlockDrops drops(t);
+  stageInsert(t, ptrs, batch, drops);
   TableSchema updated = t;
   updated.stats.rows += rows.size();
   catalog_.stageStats(updated, batch);
   dicts.stage(batch);
   db_.write(batch);  // rows, index entries, new dictionary codes and the row count commit together
   dicts.commit();
+  drops.commit();
   t.stats.rows = updated.stats.rows;
+  buildBlocks(t);
   return message("inserted " + plural(rows.size(), "row"));
 }
 
@@ -447,15 +458,18 @@ void Engine::insertRows(const std::string& name, const std::vector<Row>& rows) {
     }
     pkv::WriteBatch batch;
     DictTxn dicts(t);
-    stageInsert(t, chunk, batch);
+    BlockDrops drops(t);
+    stageInsert(t, chunk, batch, drops);
     TableSchema updated = t;
     updated.stats.rows += chunk.size();
     catalog_.stageStats(updated, batch);
     dicts.stage(batch);
     db_.write(batch);
     dicts.commit();
+    drops.commit();
     t.stats.rows = updated.stats.rows;
   }
+  buildBlocks(t);
 }
 
 // ---------------------------------------------------------------------------
@@ -567,14 +581,17 @@ Result Engine::modify(const Statement&, const Pipeline& p) {
 
   pkv::WriteBatch batch;
   TableSchema updated = t;
+  BlockDrops drops(t);
   if (last.kind == StepKind::Delete) {
     for (const Row& row : rows) {
       batch.remove(rowKey(t, row));
+      drops.touch(rowKey(t, row), batch);
       for (const IndexSchema& ix : t.indexes) batch.remove(indexKey(t, ix, row));
     }
     updated.stats.rows -= std::min<uint64_t>(updated.stats.rows, rows.size());
     catalog_.stageStats(updated, batch);
     db_.write(batch);
+    drops.commit();
     t.stats.rows = updated.stats.rows;
     return message("deleted " + plural(rows.size(), "row"));
   }
@@ -615,6 +632,8 @@ Result Engine::modify(const Statement&, const Pipeline& p) {
   }
   DictTxn dicts(t);
   for (size_t i = 0; i < rows.size(); i++) {
+    drops.touch(rowKey(t, rows[i]), batch);
+    drops.touch(rowKey(t, new_rows[i]), batch);
     batch.put(rowKey(t, new_rows[i]), rowPayload(t, new_rows[i]));
     for (const IndexSchema& ix : t.indexes) {
       std::string oi = indexKey(t, ix, rows[i]), ni = indexKey(t, ix, new_rows[i]);
@@ -624,7 +643,58 @@ Result Engine::modify(const Statement&, const Pipeline& p) {
   dicts.stage(batch);
   db_.write(batch);
   dicts.commit();
+  drops.commit();
   return message("updated " + plural(rows.size(), "row"));
+}
+
+// ---------------------------------------------------------------------------
+// Column blocks
+// ---------------------------------------------------------------------------
+
+void Engine::buildBlocks(TableSchema& t) {
+  ColumnBlocks* cb = t.blocks.get();
+  if (!cb || (!cb->gaps && t.stats.rows < cb->covered_rows + kBlockRows)) return;
+  // The key ranges no block covers, in order. Between two blocks (a dropped
+  // block's range) any number of rows makes a block; at the end only
+  // complete runs of kBlockRows do, so appends keep filling the tail.
+  std::string prefix = tablePrefix(t.id), end = prefixSuccessor(prefix);
+  struct Gap {
+    std::string lo, hi;
+    bool closed;
+  };
+  std::vector<Gap> gaps;
+  std::string cur = prefix;
+  for (const auto& b : cb->by_first) {
+    if (cur < b.first) gaps.push_back({cur, b.first, true});
+    cur = b.second.last_key + '\0';
+  }
+  if (cur < end) gaps.push_back({cur, end, false});
+  auto write = [&](std::vector<std::string>& keys, std::vector<Row>& rows) {
+    BlockMeta m;
+    std::string blob = encodeBlock(t, keys, rows, &m);
+    pkv::WriteBatch batch;
+    batch.put(blockKey(t, m.first_key), std::move(blob));
+    batch.put(blockMetaKey(t, m.first_key), serializeBlockMeta(m));
+    db_.write(batch);
+    cb->covered_rows += m.rows;
+    std::string first = m.first_key;
+    cb->by_first.emplace(std::move(first), std::move(m));
+    keys.clear();
+    rows.clear();
+  };
+  for (const Gap& g : gaps) {
+    RowCursor cursor(db_, t, g.lo, g.hi, nullptr, nullptr);
+    std::vector<std::string> keys;
+    std::vector<Row> rows;
+    Row r;
+    while (cursor.next(&r)) {
+      keys.push_back(rowKey(t, r));
+      rows.push_back(r);
+      if (rows.size() == kBlockRows) write(keys, rows);
+    }
+    if (g.closed && !rows.empty()) write(keys, rows);
+  }
+  cb->gaps = false;
 }
 
 // ---------------------------------------------------------------------------

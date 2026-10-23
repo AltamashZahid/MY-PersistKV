@@ -12,6 +12,7 @@
 #include <unordered_set>
 
 #include "pkql/codec.h"
+#include "pkql/colstore.h"
 #include "pkql/sketch.h"
 #include "pkql/storage.h"
 
@@ -308,6 +309,35 @@ class BatchFilter {
     }
   }
 
+  // Whether any row of a column block can pass, judged from its per-column
+  // min / max (small materialized aggregates): `ts >= x` skips blocks whose
+  // newest ts is older, `user_id == 5` blocks whose range excludes 5.
+  bool mayMatch(const BlockMeta& m, const TableSchema& t) const {
+    for (const Kernel& k : kernels_) {
+      if (k.in_list || static_cast<size_t>(k.col) >= m.cols.size() || t.cols[k.col].type != Type::Int) continue;
+      if (k.lit.type() != Type::Int) continue;
+      const BlockColumnStats& st = m.cols[k.col];
+      bool nulls_pass = st.has_nulls && nullHolds(k.op);
+      if (!st.has_range) {  // only nulls
+        if (!nulls_pass) return false;
+        continue;
+      }
+      int64_t x = k.lit.asInt();
+      bool range_pass = true;
+      switch (k.op) {
+        case Op::Eq: range_pass = st.min <= x && x <= st.max; break;
+        case Op::Ne: range_pass = !(st.min == x && st.max == x); break;
+        case Op::Lt: range_pass = st.min < x; break;
+        case Op::Le: range_pass = st.min <= x; break;
+        case Op::Gt: range_pass = st.max > x; break;
+        case Op::Ge: range_pass = st.max >= x; break;
+        default: break;
+      }
+      if (!range_pass && !nulls_pass) return false;
+    }
+    return true;
+  }
+
   // Lets the scanner apply the kernels while decoding; apply() then only
   // evaluates the conjuncts that are not kernels.
   void pushKernelsInto(BatchScanner& scanner) {
@@ -574,43 +604,65 @@ class VecAggregateOp : public Operator {
     PNode& scan = *node_.kids[0];
     std::string lo, hi;
     tableRange(scan, &lo, &hi);
-    std::vector<std::string> bounds{lo};
     size_t threads = 1;
     // Only scans estimated to read many rows: starting threads costs more
     // than a small time window takes to aggregate.
-    if (scan.cost >= static_cast<double>(kParallelMinRows)) {
-      threads = workerThreads();
-      if (threads > 1) {
-        // Several morsels per thread, so a slow one does not hold up the rest;
-        // but with many groups every morsel repeats most of them, so then
-        // one morsel per thread.
-        size_t per_thread = groupEstimate(scan) > 5000 ? 1 : 3;
-        std::vector<std::string> cuts = ctx_.db.splitPoints(lo, hi, threads * per_thread);
-        bounds.insert(bounds.end(), cuts.begin(), cuts.end());
-      }
-    }
-    bounds.push_back(hi);
-    size_t morsels = bounds.size() - 1;
-    threads = std::min(threads, morsels);
+    if (scan.cost >= static_cast<double>(kParallelMinRows)) threads = workerThreads();
     // When nearly every morsel would see nearly every group (e.g. top users
     // of a day), splitting repeats the grouping work: scan on one thread.
-    if (threads > 1 && groupEstimate(scan) * static_cast<double>(threads) > scan.cost) {
-      threads = 1;
-      bounds = {lo, hi};
-      morsels = 1;
+    if (threads > 1 && groupEstimate(scan) * static_cast<double>(threads) > scan.cost) threads = 1;
+
+    // Morsels: each column block overlapping [lo, hi), and the row-store
+    // ranges between them (cut at B+Tree separators when running parallel).
+    std::vector<Piece> pieces;
+    auto addRows = [&](const std::string& a, const std::string& b) {
+      if (!b.empty() && a >= b) return;
+      std::vector<std::string> cuts;
+      if (threads > 1) {
+        size_t per_thread = groupEstimate(scan) > 5000 ? 1 : 3;
+        cuts = ctx_.db.splitPoints(a, b, threads * per_thread);
+      }
+      std::string from = a;
+      for (std::string& c : cuts) {
+        pieces.push_back({nullptr, from, c});
+        from = std::move(c);
+      }
+      pieces.push_back({nullptr, from, b});
+    };
+    std::string cur = lo;
+    if (const ColumnBlocks* cb = scan.table->blocks.get()) {
+      for (const auto& entry : cb->by_first) {
+        const BlockMeta& m = entry.second;
+        if (m.last_key < lo) continue;
+        if (!hi.empty() && m.first_key >= hi) break;
+        if (cur < m.first_key) addRows(cur, m.first_key);
+        pieces.push_back({&m, lo, hi});
+        cur = std::max(cur, m.last_key + '\0');
+      }
     }
+    addRows(cur, hi);
+    size_t morsels = pieces.size();
+    threads = std::min(threads, morsels);
     partitions_ = threads;
 
-    std::vector<Partial> parts(morsels);
+    // On one thread a single grouper consumes every morsel in order: no
+    // partials to merge (with many groups, merging cost more than it saved).
+    std::vector<Partial> parts(threads <= 1 ? 1 : morsels);
     if (threads <= 1) {
-      for (size_t m = 0; m < morsels; m++) aggregateRange(bounds[m], bounds[m + 1], parts[m]);
+      Grouper g(*this, parts[0]);
+      for (size_t m = 0; m < morsels; m++) aggregatePiece(pieces[m], g);
+      g.finish();
     } else {
       std::atomic<size_t> next{0};
       std::exception_ptr error;
       std::mutex error_mu;
       auto work = [&] {
         try {
-          for (size_t m; (m = next.fetch_add(1)) < morsels;) aggregateRange(bounds[m], bounds[m + 1], parts[m]);
+          for (size_t m; (m = next.fetch_add(1)) < morsels;) {
+            Grouper g(*this, parts[m]);
+            aggregatePiece(pieces[m], g);
+            g.finish();
+          }
         } catch (...) {
           std::lock_guard<std::mutex> lock(error_mu);
           if (!error) error = std::current_exception();
@@ -641,7 +693,7 @@ class VecAggregateOp : public Operator {
         Value key;
         std::vector<VState> states;
       };
-      size_t partitions = threads;
+      size_t partitions = std::max<size_t>(1, partitions_);
       std::vector<std::vector<Merged>> merged(partitions);
       auto mergePartition = [&](size_t p) {
         std::unordered_map<Value, uint32_t, KeyHash, KeyEq> index;
@@ -649,7 +701,9 @@ class VecAggregateOp : public Operator {
         for (size_t m = 0; m < parts.size(); m++) {
           Partial& part = parts[m];
           for (size_t g = 0; g < part.groups.size(); g++) {
-            if (part.partition[g] != p) continue;  // computed up front: other threads move keys of their partitions
+            // Computed up front (other threads move keys of their partitions);
+            // with one partition there is nothing to choose.
+            if (partitions > 1 && part.partition[g] != p) continue;
             auto it = index.find(part.keys[g]);
             if (it == index.end()) {
               index.emplace(part.keys[g], static_cast<uint32_t>(out.size()));
@@ -685,52 +739,56 @@ class VecAggregateOp : public Operator {
     pos_ = 0;
   }
 
-  // Scans and aggregates the table rows in [lo, hi) into `out`.
-  void aggregateRange(const std::string& lo, const std::string& hi, Partial& out) const {
-    PNode& scan = *node_.kids[0];
-    BatchScanner scanner(ctx_.db, *scan.table, lo, hi, scan.needed.empty() ? nullptr : &scan.needed);
-    BatchFilter filter(scan.pred, scan.table->cols.size());
-    filter.pushKernelsInto(scanner);
-    std::vector<uint32_t> sel;
-    std::vector<std::vector<VState>>& groups = out.groups;
-    std::vector<Value>& keys = out.keys;
-    auto newGroup = [&](Value key) {
-      groups.emplace_back(aggs_.size());
-      keys.push_back(std::move(key));
-      return static_cast<uint32_t>(groups.size() - 1);
-    };
-    // The key column, and for bucket(col, w) the width keys round down to.
+  // A morsel: a column block (restricted to the scan's [lo, hi)), or a
+  // row-store key range [lo, hi).
+  struct Piece {
+    const BlockMeta* block;
+    std::string lo, hi;
+  };
+
+  // Groups one morsel's rows into a Partial, batch by batch.
+  struct Grouper {
+    const VecAggregateOp& op;
+    Partial& out;
     int key_col = -1;
-    int64_t width = 0;      // > 0: round keys down to multiples of it
+    int64_t width = 0;      // > 0: bucket(col, width) keys round down to multiples of it
     bool null_key = false;  // bucket() with a width <= 0 is null for every row
-    if (!node_.exprs.empty()) {
-      const Expr& k = *node_.exprs[0];
-      if (k.kind == ExprKind::Call) {
-        key_col = k.args[0]->index;
-        width = k.args[1]->value.asInt();
-        null_key = width <= 0;
-      } else {
-        key_col = k.index;
-      }
-    }
-    if (key_col < 0) newGroup(Value());  // `aggregate`: one group
     std::unordered_map<int64_t, uint32_t> int_groups;
     std::unordered_map<std::string, uint32_t> text_groups;
     std::vector<int64_t> code_groups;  // dictionary code -> group, -1 = none yet
     int64_t null_group = -1;
-    uint64_t passed = 0;
 
-    while (size_t n = scanner.next()) {
-      size_t m = filter.apply(scanner.cols, n, sel);
-      passed += m;
-      if (key_col < 0) {
-        std::vector<VState>& st = groups[0];
-        for (size_t a = 0; a < aggs_.size(); a++) {
-          for (size_t j = 0; j < m; j++) updateState(aggs_[a], st[a], scanner.cols, sel[j]);
+    Grouper(const VecAggregateOp& o, Partial& p) : op(o), out(p) {
+      if (!op.node_.exprs.empty()) {
+        const Expr& k = *op.node_.exprs[0];
+        if (k.kind == ExprKind::Call) {
+          key_col = k.args[0]->index;
+          width = k.args[1]->value.asInt();
+          null_key = width <= 0;
+        } else {
+          key_col = k.index;
         }
-        continue;
       }
-      const ColumnVector& kc = scanner.cols[key_col];
+      if (key_col < 0) newGroup(Value());  // `aggregate`: one group
+    }
+
+    uint32_t newGroup(Value key) {
+      out.groups.emplace_back(op.aggs_.size());
+      out.keys.push_back(std::move(key));
+      return static_cast<uint32_t>(out.groups.size() - 1);
+    }
+
+    void add(const std::vector<ColumnVector>& cols, const uint32_t* sel, size_t m) {
+      out.passed += m;
+      const std::vector<VAgg>& aggs = op.aggs_;
+      if (key_col < 0) {
+        std::vector<VState>& st = out.groups[0];
+        for (size_t a = 0; a < aggs.size(); a++) {
+          for (size_t j = 0; j < m; j++) updateState(aggs[a], st[a], cols, sel[j]);
+        }
+        return;
+      }
+      const ColumnVector& kc = cols[key_col];
       for (size_t j = 0; j < m; j++) {
         uint32_t i = sel[j];
         uint32_t g;
@@ -762,16 +820,85 @@ class VecAggregateOp : public Operator {
           if (it == int_groups.end()) it = int_groups.emplace(kc.ints[i], newGroup(kc.get(i))).first;
           g = it->second;
         }
-        for (size_t a = 0; a < aggs_.size(); a++) updateState(aggs_[a], groups[g][a], scanner.cols, i);
+        for (size_t a = 0; a < aggs.size(); a++) updateState(aggs[a], out.groups[g][a], cols, i);
       }
     }
-    out.passed = passed;
-    if (partitions_ > 1) {
-      out.partition.resize(keys.size());
-      for (size_t g = 0; g < keys.size(); g++) out.partition[g] = static_cast<uint32_t>(KeyHash()(keys[g]) % partitions_);
+
+    void finish() {
+      if (op.partitions_ > 1) {
+        out.partition.resize(out.keys.size());
+        for (size_t g = 0; g < out.keys.size(); g++) {
+          out.partition[g] = static_cast<uint32_t>(KeyHash()(out.keys[g]) % op.partitions_);
+        }
+      }
+    }
+  };
+
+  void aggregatePiece(const Piece& p, Grouper& g) const {
+    if (p.block) aggregateBlock(*p.block, p.lo, p.hi, g);
+    else aggregateRange(p.lo, p.hi, g);
+  }
+
+  // Scans and groups the row-store rows in [lo, hi).
+  void aggregateRange(const std::string& lo, const std::string& hi, Grouper& g) const {
+    PNode& scan = *node_.kids[0];
+    BatchScanner scanner(ctx_.db, *scan.table, lo, hi, scan.needed.empty() ? nullptr : &scan.needed);
+    BatchFilter filter(scan.pred, scan.table->cols.size());
+    filter.pushKernelsInto(scanner);
+    std::vector<uint32_t> sel;
+    while (size_t n = scanner.next()) {
+      size_t m = filter.apply(scanner.cols, n, sel);
+      g.add(scanner.cols, sel.data(), m);
     }
   }
 
+  // Groups a column block's rows that lie in [lo, hi): the needed columns
+  // are decoded straight from the compressed block.
+  void aggregateBlock(const BlockMeta& meta, const std::string& lo, const std::string& hi, Grouper& g) const {
+    PNode& scan = *node_.kids[0];
+    const TableSchema& t = *scan.table;
+    BatchFilter filter(scan.pred, t.cols.size());
+    if (!filter.mayMatch(meta, t)) return;  // its statistics rule out every row
+    std::string blob;
+    if (!ctx_.db.get(blockKey(t, meta.first_key), &blob)) throw Error("missing column block in table " + t.name);
+    // A block sticking out of the scan range is cut by its (sorted) keys.
+    bool partial = meta.first_key < lo || (!hi.empty() && meta.last_key >= hi);
+    int pk = t.pk[0];
+    std::vector<bool> need = scan.needed.empty() ? std::vector<bool>(t.cols.size(), true) : scan.needed;
+    if (partial) need[pk] = true;
+    std::vector<ColumnVector> cols;
+    uint32_t n = decodeBlock(t, blob, &need, cols);
+    size_t b = 0, e = n;
+    if (partial) {
+      std::string key;
+      auto keyAt = [&](size_t i) -> const std::string& {
+        key = tablePrefix(t.id);
+        encodeKey(Value::integer(cols[pk].ints[i]), key);
+        return key;
+      };
+      auto firstAtLeast = [&](const std::string& bound) {
+        size_t a = 0, z = n;
+        while (a < z) {
+          size_t mid = (a + z) / 2;
+          if (keyAt(mid) < bound) a = mid + 1;
+          else z = mid;
+        }
+        return a;
+      };
+      b = firstAtLeast(lo);
+      if (!hi.empty()) e = firstAtLeast(hi);
+    }
+    std::vector<uint32_t> sel;
+    size_t m = filter.apply(cols, n, sel);
+    if (partial) {
+      size_t k = 0;
+      for (size_t j = 0; j < m; j++) {
+        if (sel[j] >= b && sel[j] < e) sel[k++] = sel[j];
+      }
+      m = k;
+    }
+    g.add(cols, sel.data(), m);
+  }
 
   bool next(Row* row) override {
     if (pos_ >= groups_.size()) return false;

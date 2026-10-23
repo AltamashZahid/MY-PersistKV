@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "pkql/codec.h"
+#include "pkql/colstore.h"
 #include "pkql/engine.h"
 #include "persistkv/file.h"
 
@@ -378,6 +379,114 @@ TEST(time_ranges_use_the_key_and_stay_fresh) {
   std::this_thread::sleep_for(std::chrono::milliseconds(1300));  // margins for slow (sanitizer) builds
   CHECK(cell(db, "from ev | filter ts >= ago(1h) and ts <= now() | aggregate { n = count() }") == "2");
   CHECK(db.planCacheHits() > 0);
+}
+
+TEST(column_block_codec_round_trips) {
+  TableSchema t;
+  t.id = 3;
+  t.name = "b";
+  t.cols = {{"ts", Type::Int, false}, {"i", Type::Int, true}, {"f", Type::Float, true}, {"g", Type::Float, true},
+            {"s", Type::Text, true}, {"d", Type::Text, true}, {"b", Type::Bool, true}};
+  t.pk = {0};
+  t.dicts.resize(t.cols.size());
+  t.dicts[5] = std::make_shared<TextDict>();
+  std::mt19937_64 rng(4);
+  std::vector<Row> rows;
+  std::vector<std::string> keys;
+  int64_t ts = -5000;
+  const int64_t extremes[] = {INT64_MIN, INT64_MAX, 0, -1, 1};
+  for (int i = 0; i < 3000; i++) {
+    ts += 1 + static_cast<int64_t>(rng() % 900);
+    Value iv = i % 11 == 0 ? Value::null() : Value::integer(i >= 1 && i <= 5 ? extremes[i - 1] : static_cast<int64_t>(rng() % 2001) - 1000);
+    Value fv = i % 13 == 0 ? Value::null() : Value::real(static_cast<double>(rng() % 100000) / 100.0);  // 2 decimals: scaled
+    Value gv = Value::real(i == 7 ? -0.0 : std::ldexp(static_cast<double>(rng() % 1000), -9));          // raw doubles
+    Value sv = i % 7 == 0 ? Value::null() : Value::text(i % 5 == 0 ? "" : "s" + std::to_string(rng() % 50));
+    std::string word = i % 3 ? "view" : "buy";
+    t.dicts[5]->codeFor(word);
+    rows.push_back({Value::integer(ts), iv, fv, gv, sv, Value::text(word), i % 17 == 0 ? Value::null() : Value::boolean(i % 2)});
+    keys.push_back(rowKey(t, rows.back()));
+  }
+  BlockMeta meta;
+  std::string blob = encodeBlock(t, keys, rows, &meta);
+  CHECK(meta.rows == 3000 && meta.first_key == keys.front() && meta.last_key == keys.back());
+  CHECK(meta.cols[1].has_nulls && meta.cols[1].min == INT64_MIN && meta.cols[1].max == INT64_MAX);
+  std::vector<ColumnVector> cols;
+  CHECK(decodeBlock(t, blob, nullptr, cols) == 3000);
+  bool same = true;
+  for (size_t i = 0; i < rows.size() && same; i++) {
+    for (size_t c = 0; c < t.cols.size() && same; c++) {
+      Value got = cols[c].get(i);
+      const Value& want = rows[i][c];
+      if (got.isNull() != want.isNull()) same = false;
+      else if (!want.isNull() && want.type() == Type::Float) {
+        double a = got.asFloat(), b = want.asFloat();
+        same = std::memcmp(&a, &b, 8) == 0;  // bit-exact, -0.0 included
+      } else if (!want.isNull()) {
+        same = compare(got, want) == 0;
+      }
+    }
+  }
+  CHECK(same);
+  CHECK(cols[5].codes[0] >= 0);                        // dictionary text stays coded
+  // About 8 bytes a row for the raw doubles, ~4 for the short strings, and
+  // 1-2 each for the others: the two int64 extremes are PFOR exceptions,
+  // so they do not widen the other 2998 values to 64 bits.
+  std::printf("         (block: %zu bytes for %zu rows)\n", blob.size(), rows.size());
+  CHECK(blob.size() < rows.size() * 18);
+  std::vector<bool> only_ts(t.cols.size(), false);
+  only_ts[0] = true;
+  std::vector<ColumnVector> part;
+  decodeBlock(t, blob, &only_ts, part);
+  CHECK(part[0].ints.size() == 3000 && part[1].ints.empty());  // unneeded columns are skipped
+}
+
+TEST(column_blocks_match_the_row_store) {
+  std::string dir = freshDir("blocks");
+  const char* queries[] = {
+      "from ev | group kind { n = count(), s = sum(amount), u = count_distinct(user_id), p = p95(amount) }",
+      "from ev | filter ts >= 30000000 and ts < 61000000 | group h = bucket(ts, 1h) { n = count(), m = median(amount) }",
+      "from ev | filter user_id == 7 | aggregate { n = count(), s = sum(amount) }",           // min/max skip blocks
+      "from ev | filter user_id > 100000 | aggregate { n = count() }",                      // every block skipped
+      "from ev | filter kind == \"buy\" and amount > 50 | group user_id { n = count() } | sort -n, user_id | take 5",
+      "from ev | aggregate { n = count(), lo = min(ts), hi = max(ts), a = avg(amount), z = count_distinct(note) }",
+  };
+  auto check = [&](Engine& db) {
+    for (const char* q : queries) {
+      std::string vec = db.run(q).back().format();
+      db.plannerOptions().vectorize = false;
+      std::string rowwise = db.run(q).back().format();
+      db.plannerOptions().vectorize = true;
+      CHECK(vec.substr(0, vec.rfind('(')) == rowwise.substr(0, rowwise.rfind('(')));
+    }
+  };
+  {
+    Engine db(dir, fast());
+    db.run("table ev (ts: int key, user_id: int, kind: text, amount: float?, note: text?)");
+    std::vector<Row> rows;
+    std::mt19937 rng(21);
+    for (int i = 0; i < 100000; i++) {
+      rows.push_back({Value::integer(static_cast<int64_t>(i) * 1000), Value::integer(rng() % 5000),
+                      Value::text(rng() % 4 ? "view" : "buy"),
+                      rng() % 19 == 0 ? Value::null() : Value::real(static_cast<double>(rng() % 10000) / 100.0),
+                      rng() % 3 == 0 ? Value::null() : Value::text("n" + std::to_string(rng() % 9000))});
+    }
+    db.insertRows("ev", rows);
+    CHECK(has(plan(db, "from ev | aggregate { n = count() }"), "(6 column blocks)"));  // 6 x 16384, the tail stays rows
+    check(db);
+    // Writes inside blocks drop them; the rows stay readable from the row store.
+    db.run("from ev | filter ts >= 20000000 and ts < 20010000 | delete");
+    db.run("from ev | filter ts == 50000000 | update amount = 1234.5, kind = \"refund\"");
+    db.run("insert ev {ts: 70000500, user_id: 1, kind: \"late\", amount: 1.0}");  // a late event inside a block
+    check(db);
+    db.insertRows("ev", {{Value::integer(200000000), Value::integer(2), Value::text("view"), Value::real(1), Value::null()}});
+    check(db);  // the insert rebuilt blocks over the dropped ranges
+    CHECK(db.checkIntegrity().empty());
+  }
+  Engine db(dir, fast());  // blocks are found again on reopen
+  CHECK(has(plan(db, "from ev | aggregate { n = count() }"), "column blocks)"));
+  check(db);
+  CHECK(cell(db, "from ev | filter kind == \"refund\" | aggregate { n = count() }") == "1");
+  CHECK(cell(db, "from ev | filter kind == \"late\" | aggregate { n = count() }") == "1");
 }
 
 TEST(approximate_aggregates_stay_within_their_bounds) {

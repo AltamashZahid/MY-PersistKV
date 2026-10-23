@@ -8,6 +8,7 @@
 #include <map>
 
 #include "pkql/plan.h"
+#include "pkql/colstore.h"
 #include "pkql/vector.h"
 
 namespace pkql {
@@ -1163,6 +1164,9 @@ std::string describe(const PNode& p) {
       s += k.empty() ? " (full)" : " [" + k + "]";
       if (p.reverse) s += " reverse";
       if (p.pred) s += " filter " + toString(*p.pred);
+      if (p.table->blocks && !p.table->blocks->by_first.empty() && !p.point) {
+        s += " (" + std::to_string(p.table->blocks->by_first.size()) + " column blocks)";
+      }
       return s;
     }
     case PKind::IndexScan: {
