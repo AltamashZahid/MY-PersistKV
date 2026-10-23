@@ -454,6 +454,16 @@ class IntSet {
 // int64 key -> group number.
 class IntMap {
  public:
+  void reserve(size_t n) {
+    size_t cap = 16;
+    while (cap < 2 * n) cap <<= 1;
+    if (cap > keys_.size()) {
+      keys_.assign(cap, 0);
+      vals_.assign(cap, kEmpty);
+      size_ = 0;
+    }
+  }
+
   // The group for k, calling make() for a new one.
   template <typename Make>
   uint32_t findOrAdd(int64_t k, Make make) {
@@ -512,6 +522,13 @@ struct VState {
   }
 };
 
+// Value::integer(x).hash() without building a Value (the row path hashes
+// Values, and both paths must feed sketches the same hashes).
+inline uint64_t intHash(int64_t x) {
+  if (x > -9000000000000000LL && x < 9000000000000000LL) return std::hash<int64_t>()(x);
+  return Value::integer(x).hash();
+}
+
 void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols, uint32_t i) {
   if (a.fn == VFn::Count) {
     s.count++;
@@ -561,7 +578,7 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
       // The same hashes as the row path (Value::hash), so both give one estimate.
       if (c.type == Type::Text) s.extra().hll.add(std::hash<std::string_view>()(c.textAt(i)));
       else if (c.type == Type::Float) s.extra().hll.add(Value::real(c.floats[i]).hash());
-      else s.extra().hll.add(Value::integer(c.ints[i]).hash());
+      else s.extra().hll.add(intHash(c.ints[i]));
       break;
     case VFn::ApproxQuantile:
       s.extra().sketch.add(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
@@ -734,9 +751,10 @@ void mergeState(const VAgg& a, VState& into, VState& from) {
 class VecAggregateOp : public Operator {
   // One morsel's (or the whole scan's) groups, in first-seen order.
   struct Partial {
-    std::vector<std::vector<VState>> groups;
+    std::vector<VState> states;  // flat: group g's aggregate a is states[g * aggregates + a]
     std::vector<Value> keys;
     std::vector<uint32_t> partition;  // per group: the merge partition its key hashes to
+    std::vector<uint64_t> first;      // per group: morsel << 32 | creation number, where first seen
     uint64_t passed = 0;
   };
 
@@ -778,7 +796,15 @@ class VecAggregateOp : public Operator {
     if (scan.cost >= static_cast<double>(kParallelMinRows)) threads = workerThreads();
     // When nearly every morsel would see nearly every group (e.g. top users
     // of a day), splitting repeats the grouping work: scan on one thread.
-    if (threads > 1 && groupEstimate(scan) * static_cast<double>(threads) > scan.cost) threads = 1;
+    // Parallel: each worker scans rows / threads but builds partial groups that
+    // the merge then combines, at several times the cost of scanning a row
+    // (measured: 50K groups over 1M rows took 66 ms on 16 threads, 25 ms on
+    // one). So stay serial unless the scan saving outweighs the merge.
+    {
+      double est = groupEstimate(scan), t = static_cast<double>(threads);
+      if (threads > 1 && scan.cost / t + 5 * est * t > scan.cost + est) threads = 1;
+    }
+    expected_groups_ = static_cast<size_t>(std::min(groupEstimate(scan), std::min(scan.cost, 1e6))) / std::max<size_t>(1, threads);
 
     // Morsels: each column block overlapping [lo, hi), and the row-store
     // ranges between them (cut at B+Tree separators when running parallel).
@@ -815,24 +841,28 @@ class VecAggregateOp : public Operator {
 
     // On one thread a single grouper consumes every morsel in order: no
     // partials to merge (with many groups, merging cost more than it saved).
-    std::vector<Partial> parts(threads <= 1 ? 1 : morsels);
+    // One partial per worker (not per morsel): with many groups, per-morsel
+    // partials repeated most groups in every morsel and merging them cost
+    // more than the parallel scan saved.
+    std::vector<Partial> parts(threads <= 1 ? 1 : threads);
     if (threads <= 1) {
       Grouper g(*this, parts[0]);
       Workspace& ws = threadWorkspace();
       for (size_t m = 0; m < morsels; m++) aggregatePiece(pieces[m], g, ws);
       g.finish();
     } else {
-      std::atomic<size_t> next{0};
+      std::atomic<size_t> next{0}, worker{0};
       std::exception_ptr error;
       std::mutex error_mu;
       auto work = [&] {
         try {
           Workspace& ws = threadWorkspace();  // per thread, reused across morsels and queries
+          Grouper g(*this, parts[worker.fetch_add(1)]);
           for (size_t m; (m = next.fetch_add(1)) < morsels;) {
-            Grouper g(*this, parts[m]);
+            g.morsel = m;  // a worker takes morsels in increasing order
             aggregatePiece(pieces[m], g, ws);
-            g.finish();
           }
+          g.finish();
         } catch (...) {
           std::lock_guard<std::mutex> lock(error_mu);
           if (!error) error = std::current_exception();
@@ -843,20 +873,22 @@ class VecAggregateOp : public Operator {
       if (error) std::rethrow_exception(error);
     }
 
-    // Merge. With one morsel its groups are the result. Otherwise each
-    // thread merges one hash partition of the keys across all morsels (in
-    // morsel order), and the merged groups are put back in first-seen order
-    // by the (morsel, group) where each first appeared.
-    groups_.clear();
+    // Merge. With one partial its groups are the result. Otherwise each
+    // thread merges one hash partition of the keys across all partials, and
+    // the merged groups are put back in first-seen order by the earliest
+    // (morsel, creation number) stamp each had: the morsel that first holds
+    // a key was taken by one worker, which created the key's group there.
+    states_.clear();
     keys_.clear();
+    const size_t na = aggs_.size();
     uint64_t passed = 0;
     for (const Partial& part : parts) passed += part.passed;
     if (parts.size() == 1) {
-      groups_ = std::move(parts[0].groups);
+      states_ = std::move(parts[0].states);
       keys_ = std::move(parts[0].keys);
     } else {
       struct Merged {
-        uint64_t first;  // morsel << 32 | group index there
+        uint64_t first;  // earliest (morsel << 32 | creation number)
         Value key;
         std::vector<VState> states;
       };
@@ -867,17 +899,21 @@ class VecAggregateOp : public Operator {
         std::vector<Merged>& out = merged[p];
         for (size_t m = 0; m < parts.size(); m++) {
           Partial& part = parts[m];
-          for (size_t g = 0; g < part.groups.size(); g++) {
+          for (size_t g = 0; g < part.keys.size(); g++) {
             // Computed up front (other threads move keys of their partitions);
             // with one partition there is nothing to choose.
             if (partitions > 1 && part.partition[g] != p) continue;
             auto it = index.find(part.keys[g]);
             if (it == index.end()) {
               index.emplace(part.keys[g], static_cast<uint32_t>(out.size()));
-              out.push_back({(static_cast<uint64_t>(m) << 32) | g, std::move(part.keys[g]), std::move(part.groups[g])});
+              Merged mg{part.first[g], std::move(part.keys[g]), std::vector<VState>(na)};
+              for (size_t a = 0; a < na; a++) mg.states[a] = std::move(part.states[g * na + a]);
+              out.push_back(std::move(mg));
               continue;
             }
-            for (size_t a = 0; a < aggs_.size(); a++) mergeState(aggs_[a], out[it->second].states[a], part.groups[g][a]);
+            Merged& into = out[it->second];
+            into.first = std::min(into.first, part.first[g]);
+            for (size_t a = 0; a < na; a++) mergeState(aggs_[a], into.states[a], part.states[g * na + a]);
           }
         }
       };
@@ -890,15 +926,15 @@ class VecAggregateOp : public Operator {
         for (Merged& mg : part) all.push_back(std::move(mg));
       }
       std::sort(all.begin(), all.end(), [](const Merged& a, const Merged& b) { return a.first < b.first; });
-      groups_.reserve(all.size());
+      states_.reserve(all.size() * na);
       keys_.reserve(all.size());
       for (Merged& mg : all) {
         keys_.push_back(std::move(mg.key));
-        groups_.push_back(std::move(mg.states));
+        for (VState& st : mg.states) states_.push_back(std::move(st));
       }
     }
-    if (node_.exprs.empty() && groups_.empty()) {  // `aggregate`: one row, even over zero rows
-      groups_.emplace_back(aggs_.size());
+    if (node_.exprs.empty() && keys_.empty()) {  // `aggregate`: one row, even over zero rows
+      states_.resize(na);
       keys_.emplace_back();
     }
     scan.actual_rows = passed;
@@ -936,13 +972,26 @@ class VecAggregateOp : public Operator {
           key_col = k.index;
         }
       }
-      if (key_col < 0) newGroup(Value());  // `aggregate`: one group
+      if (key_col < 0) {
+        newGroup(Value());  // `aggregate`: one group
+      } else {
+        // Sized from the statistics, so tables do not regrow and move every
+        // state as groups appear.
+        size_t est = op.expected_groups_;
+        out.states.reserve(est * op.aggs_.size());
+        out.keys.reserve(est);
+        out.first.reserve(est);
+        int_groups.reserve(est);
+      }
     }
 
+    uint64_t morsel = 0;  // set by parallel workers before each morsel
+
     uint32_t newGroup(Value key) {
-      out.groups.emplace_back(op.aggs_.size());
+      out.first.push_back((morsel << 32) | out.keys.size());
+      out.states.resize(out.states.size() + op.aggs_.size());
       out.keys.push_back(std::move(key));
-      return static_cast<uint32_t>(out.groups.size() - 1);
+      return static_cast<uint32_t>(out.keys.size() - 1);
     }
 
     std::vector<uint32_t> gids;  // per selected row: its group
@@ -950,15 +999,16 @@ class VecAggregateOp : public Operator {
     // Rows counted without being looked at (a column block's row count).
     void addCount(uint64_t rows) {
       out.passed += rows;
-      for (VState& st : out.groups[0]) st.count += static_cast<int64_t>(rows);
+      for (size_t a = 0; a < op.aggs_.size(); a++) out.states[a].count += static_cast<int64_t>(rows);
     }
 
     // Updates aggregate a of the rows' groups, one tight loop per kind of
     // aggregate (vectorized aggregation) instead of a switch per row.
     void update(size_t a, const std::vector<ColumnVector>& cols, const uint32_t* sel, size_t m) {
       const VAgg& agg = op.aggs_[a];
-      std::vector<std::vector<VState>>& groups = out.groups;
-      auto state = [&](size_t j) -> VState& { return groups[key_col < 0 ? 0 : gids[j]][a]; };
+      VState* states = out.states.data();
+      size_t na = op.aggs_.size();
+      auto state = [&](size_t j) -> VState& { return states[(key_col < 0 ? 0 : gids[j]) * na + a]; };
       if (agg.fn == VFn::Count) {
         for (size_t j = 0; j < m; j++) state(j).count++;
         return;
@@ -1135,10 +1185,10 @@ class VecAggregateOp : public Operator {
   }
 
   bool next(Row* row) override {
-    if (pos_ >= groups_.size()) return false;
+    if (pos_ >= keys_.size()) return false;
     row->clear();
     if (!node_.exprs.empty()) row->push_back(keys_[pos_]);
-    for (size_t a = 0; a < aggs_.size(); a++) row->push_back(finalValue(aggs_[a], groups_[pos_][a]));
+    for (size_t a = 0; a < aggs_.size(); a++) row->push_back(finalValue(aggs_[a], states_[pos_ * aggs_.size() + a]));
     pos_++;
     return true;
   }
@@ -1165,9 +1215,10 @@ class VecAggregateOp : public Operator {
   }
 
   ExecContext& ctx_;
-  size_t partitions_ = 1;  // merge partitions (= threads) for this run
+  size_t partitions_ = 1;       // merge partitions (= threads) for this run
+  size_t expected_groups_ = 0;  // per partial, from the statistics: sizes its tables up front
   std::vector<VAgg> aggs_;
-  std::vector<std::vector<VState>> groups_;  // in first-seen order
+  std::vector<VState> states_;  // flat, per group in first-seen order: aggregate a at [g * aggregates + a]
   std::vector<Value> keys_;
   size_t pos_ = 0;
 };

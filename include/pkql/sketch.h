@@ -34,14 +34,14 @@ class HyperLogLog {
 
   void merge(HyperLogLog& o) {
     if (o.reg_.empty()) {
-      for (uint64_t h : o.sparse_) {
+      o.sparse_.forEach([&](uint64_t h) {
         if (reg_.empty()) {
           sparse_.insert(h);
           if (sparse_.size() > kSparseMax) densify();
         } else {
           addDense(h);
         }
-      }
+      });
       return;
     }
     if (reg_.empty()) densify();
@@ -83,11 +83,62 @@ class HyperLogLog {
   }
   void densify() {
     reg_.assign(kM, 0);
-    for (uint64_t h : sparse_) addDense(h);
+    sparse_.forEach([&](uint64_t h) { addDense(h); });
     sparse_.clear();
   }
 
-  std::unordered_set<uint64_t> sparse_;
+  // The exact sparse form: open addressing over the (already mixed)
+  // hashes, 0 marking an empty slot (a hash of 0 is kept aside).
+  class HashSet {
+   public:
+    void insert(uint64_t h) {
+      if (h == 0) {
+        size_ += !has_zero_;
+        has_zero_ = true;
+        return;
+      }
+      if ((size_ + 1) * 2 > slots_.size()) grow();
+      size_t mask = slots_.size() - 1;
+      for (size_t i = h & mask;; i = (i + 1) & mask) {
+        if (slots_[i] == 0) {
+          slots_[i] = h;
+          size_++;
+          return;
+        }
+        if (slots_[i] == h) return;
+      }
+    }
+    size_t size() const { return size_; }
+    void clear() {
+      slots_.clear();
+      slots_.shrink_to_fit();
+      size_ = 0;
+      has_zero_ = false;
+    }
+    template <typename Fn>
+    void forEach(Fn fn) const {
+      if (has_zero_) fn(0);
+      for (uint64_t h : slots_) {
+        if (h) fn(h);
+      }
+    }
+
+   private:
+    void grow() {
+      std::vector<uint64_t> old = std::move(slots_);
+      slots_.assign(std::max<size_t>(32, old.size() * 2), 0);
+      size_t keep = has_zero_ ? 1 : 0;
+      size_ = keep;
+      for (uint64_t h : old) {
+        if (h) insert(h);
+      }
+    }
+    std::vector<uint64_t> slots_;
+    size_t size_ = 0;
+    bool has_zero_ = false;
+  };
+
+  HashSet sparse_;
   std::vector<uint8_t> reg_;  // empty while sparse
 };
 
