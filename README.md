@@ -1,12 +1,44 @@
-# MY-PersistKV: PKQL, a pipeline query language with a cost-based optimizer
+# MY-PersistKV: PKQL, an embedded engine for event analytics
 
 [![CI](https://github.com/AltamashZahid/MY-PersistKV/actions/workflows/ci.yml/badge.svg)](https://github.com/AltamashZahid/MY-PersistKV/actions/workflows/ci.yml)
 
-PKQL is a relational query language and engine built on top of
+PKQL is an embedded database for **event data**: append-only logs of clicks, views,
+purchases, API calls or app telemetry, queried by time range and then filtered and
+grouped. It has its own pipeline language with time built in, a System R–style
+cost-based optimizer and a vectorized executor. It runs on top of
 [PersistKV](https://github.com/AltamashZahid/persist_KV), my crash-safe B+Tree
-key-value store (pinned here as a git submodule). It has its own language, a
-System R–style cost-based optimizer, and a Volcano-style executor. Its results are
-checked against SQLite with randomized differential testing.
+key-value store (pinned here as a git submodule). Results are checked against SQLite
+with randomized differential testing.
+
+On a 1M-event log it loads 1.3–1.6× faster than SQLite and runs time-window aggregations,
+percentiles and distinct counts 2.6–3.4× faster (see [the benchmark](#benchmark-event-analytics-vs-sqlite)).
+
+```
+table events (ts: int key, user_id: int, kind: text, country: text, amount: float, latency: int)
+index events_user on events (user_id)
+
+from events
+| filter ts >= ago(1d) and kind == "purchase"
+| group hour = bucket(ts, 1h) { revenue = sum(amount), orders = count() }
+| sort hour
+
+from events | filter ts >= ago(6h) | group country { p95 = p95(latency), n = count() }
+from events | filter user_id == 42 | sort -ts | take 20        # reads the index backwards
+```
+
+## Built for event analytics
+
+| Feature | What it does |
+|---|---|
+| **Time-keyed tables** | `ts: int key` (milliseconds since 1970) stores events in time order. Appends fill pages ~89% full, and a time range is one contiguous key range. |
+| **Durations and `now()` / `ago(d)`** | `500ms 30s 5m 1h 7d 2w` are int literals in ms. `filter ts >= ago(1h)` becomes a primary-key range, so only the last hour is read. Cached plans refresh `now()` on every run. |
+| **`bucket(ts, 1h)`** | rounds a timestamp down to a bucket for time series (also correct below 1970); `time_text(ts)` formats it as UTC text. |
+| **Percentiles** | `median`, `p90`, `p95`, `p99`: exact, interpolated like SQL's `percentile_cont`. |
+| **Latest-N reads** | `sort -ts \| take 20` over a key or index range reads it **backwards** and stops after 20 rows. |
+| **Vectorized aggregation** | time-window group-bys, `count_distinct` and percentiles run over 1,024-row column batches; simple filters drop rows while they are being decoded. |
+| **Fast, crash-safe ingest** | inserts are batched into WAL-logged `WriteBatch`es and merged into leaf pages in key order; 270–350K events/s with a secondary index, including `analyze`. |
+
+The query language itself:
 
 ```
 table users  (id: int key, name: text, city: text, age: int?)
@@ -82,48 +114,76 @@ before writing any of them, which avoids the "Halloween problem".
 
 | Test | What it checks |
 |---|---|
-| Unit tests (19) | encoding order (randomized), language semantics, error messages, update/delete index maintenance (including rows swapping primary keys), atomic statements, persistence, and **which plan the optimizer chooses** for each kind of query |
+| Unit tests (27) | encoding order (randomized) and float round-trips, language semantics, error messages, update/delete index maintenance (including rows swapping primary keys), atomic statements, bulk loads, time functions and percentiles, cached time ranges that must see time move, reverse scans, vectorized vs row-at-a-time results, and **which plan the optimizer chooses** for each kind of query |
 | Planner-equivalence test | every query returns identical rows under all 8 combinations of optimizer features |
-| **Differential testing against SQLite** | random data loaded into both engines; thousands of randomly generated queries (filters with `and`/`or`/`not`/`in`/`starts_with`, 2- and 3-table joins, group-bys, sort with take) written in both PKQL and SQL; results must match under 3 optimizer configurations. **10,000+ executions, 0 mismatches.** |
+| **Differential testing against SQLite** | random data loaded into both engines; thousands of randomly generated queries (filters with `and`/`or`/`not`/`in`/`starts_with`, 2- and 3-table joins, group-bys including `bucket()` keys, `median`/`p90` against SQLite's `median`/`percentile_cont`, sort with take) written in both PKQL and SQL; results must match under 4 optimizer configurations (including row-at-a-time). **8,000 executions per run, 0 mismatches.** |
 
 ```sh
 git clone --recursive https://github.com/AltamashZahid/MY-PersistKV.git
 cmake -S . -B build -G Ninja && cmake --build build
 cd build && ./pkql_tests && ./differential_test 1000
 ./pkql mydb                      # interactive shell; type `help`
+./bench_events 1 /tmp/bench      # the event benchmark below (1M events)
 ```
 
-## Benchmark vs SQLite (honest numbers)
+## Benchmark: event analytics vs SQLite
 
-`bench_vs_sqlite`: the same data (10K users, 1K products, 100K orders, 2 × 40K
-unindexed rows), the same indexes, a 16 MB page cache for both, and each query
-parsed fresh every time in both engines. Runs alternate between the two engines
-(PKQL, SQLite, PKQL, ...) so both see the same machine state, and the median of
-9 is reported. Hardware: i5-13500H, NVMe SSD,
-Windows 11, g++ 16 `-O2`.
-
-Times are from the first run. The ratio column shows both runs. Absolute times move
-with machine load, so compare the ratios, which are measured interleaved.
+`bench_events`: 1M events over 7 days (5 kinds with a skewed mix, 10 countries,
+50K users of whom a few are very active, long-tailed latencies), keyed by `ts` with
+an index on `user_id`. Both engines use the same index, a 16 MB page cache, and parse
+every query fresh. SQL gets the same time cutoffs as literals. Runs alternate between
+the engines and the median of 9 is reported. Times are from the second of two runs;
+the ratio column shows both. Hardware: i5-13500H, NVMe SSD, Windows 11, g++ 16 `-O2`.
 
 | Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite (2 runs) | PKQL plan |
 |---|---|---|---|---|
-| full scan + group by | 17.9 | 69.9 | **0.26× / 0.26× (3.8× faster)** | HashAggregate < TableScan (vectorized) |
-| aggregate, then join, then top 10 | 21.3 | 82.0 | **0.26× / 0.36× (2.8–3.8× faster)** | TopN < HashJoin < HashAggregate |
-| join all orders to products + group | 23.9 | 62.7 | **0.38× / 0.40× (2.5× faster)** | HashJoin < TableScan × 2 |
-| equi-join on unindexed columns | 38.8 | 69.8 | **0.56× / 0.64× (1.6–1.8× faster)** | HashJoin < TableScan × 2 |
-| point lookup by primary key (×1000) | 8.8 | 14.6 | **0.60× / 0.59× (1.7× faster)** | PointLookup (cached plan) |
-| primary-key range, 5000 rows | 0.4 | 0.5 | 0.89× / 1.03× | TableScan (key range) |
-| secondary index lookup (×200) | 5.3 | 5.7 | 0.93× / 0.91× | IndexScan (batched fetch) |
-| top 10 by unindexed column | 11.6 | 9.9 | 1.17× / 1.25× | TopN < TableScan (vectorized) |
-| first 10 by indexed column | < 0.1 | < 0.1 | 1.29× / 1.21× | Limit < IndexScan (sort removed) |
-| selective join (city + age filter) | 1.1 | 0.6 | 1.83× / 1.48× | IndexJoin < IndexScan (batched fetch) |
+| last hour: events by kind | 1.09 | 3.73 | **0.31× / 0.29×** | HashAggregate < TableScan [ts >= ago(1h)] |
+| last 10 minutes: events per minute | 0.20 | 0.58 | **0.36× / 0.34×** | Sort < HashAggregate (bucket) < TableScan |
+| last 6h: p95 latency by country | 8.92 | 25.39 | **0.34× / 0.35×** | HashAggregate < TableScan |
+| last 24h: top 10 users by events | 44.41 | 70.05 | **0.60× / 0.63×** | TopN < HashAggregate < TableScan |
+| 7 days: daily active users | 368.73 | 1006.25 | **0.38× / 0.37×** | Sort < HashAggregate (count_distinct) < TableScan |
+| 7 days: events and revenue by kind | 328.34 | 976.12 | **0.34× / 0.34×** | HashAggregate < TableScan |
+| 7 days: p50 / p99 latency by kind | 401.78 | 1092.31 | **0.37× / 0.37×** | HashAggregate < TableScan |
+| one user's latest 20 events (×200) | 11.79 | 11.10 | 1.13× / 1.06× | Limit < IndexScan reverse |
+| last 24h: hourly revenue from purchases | 19.95 | 15.65 | 1.24× / 1.27× | Sort < HashAggregate (bucket) < TableScan |
 
-**PKQL beats SQLite on scans, aggregation, joins and point lookups** (1.6–3.8×
-faster), and is level on index lookups and key ranges. It is still slower on three:
-top 10 by an unindexed column (~1.2×, not yet profiled),
-"first 10" (microseconds in both engines, so fixed per-query overhead
-dominates), and the selective join (1.5–1.8×: about 1,300 lookups, bound by
-PersistKV's per-lookup cost when CPU caches are cold).
+| Load 1M events + analyze | PKQL | SQLite |
+|---|---|---|
+| time (2 runs) | **3.75 s / 2.84 s** | 5.06 s / 4.52 s |
+| file size | 67.2 MB | 42.2 MB |
+
+PKQL is **2.6–3.4× faster on time-window aggregations, percentiles and distinct
+counts**, and loads faster. It is about level on a user's latest events (both read
+an index backwards) and 1.25× slower on the hourly revenue of purchases. There 95%
+of the scanned rows fail the `kind` filter, and decoding and checking `kind` costs
+PKQL about 25 ns per row (measured warm). Its files are 1.6× larger. About 14 MB of
+the 25 MB difference is per-entry overhead: a 2-byte slot, 2-byte key length and
+3-byte value header on each of the 2M entries (rows plus index entries).
+
+## General benchmark vs SQLite
+
+`bench_vs_sqlite`: 10K users, 1K products, 100K orders and 2 × 40K unindexed rows,
+the same indexes, a 16 MB page cache for both, every query parsed fresh, runs
+interleaved, median of 9. Times from the first run; ratios from both. Loading takes
+0.5 s for PKQL and 0.3 s for SQLite.
+
+| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite (2 runs) | PKQL plan |
+|---|---|---|---|---|
+| full scan + group by | 12.0 | 43.2 | **0.28× / 0.23×** | HashAggregate < TableScan (vectorized) |
+| aggregate, then join, then top 10 | 18.6 | 72.3 | **0.26× / 0.27×** | TopN < HashJoin < HashAggregate |
+| join all orders to products + group | 23.5 | 61.3 | **0.38× / 0.36×** | HashJoin < TableScan × 2 |
+| equi-join on unindexed columns | 36.2 | 70.6 | **0.51× / 0.59×** | HashJoin < TableScan × 2 |
+| point lookup by primary key (×1000) | 4.1 | 5.1 | **0.79× / 0.71×** | PointLookup (cached plan) |
+| top 10 by unindexed column | 7.4 | 7.3 | 1.02× / 1.34× | TopN < TableScan (vectorized) |
+| primary-key range, 5000 rows | 0.3 | 0.3 | 1.08× / 1.06× | TableScan (key range) |
+| secondary index lookup (×200) | 3.8 | 3.3 | 1.15× / 1.09× | IndexScan (batched fetch) |
+| selective join (city + age filter) | 0.6 | 0.4 | 1.61× / 1.71× | IndexJoin < IndexScan (batched fetch) |
+| first 10 by indexed column | < 0.1 | < 0.1 | 1.69× / 1.72× | Limit < IndexScan (sort removed) |
+
+Ratios move with machine state (this machine was 2–3× faster during these runs than
+in earlier ones), so the README keeps both runs. Scans, aggregation and joins are
+2–4× faster than SQLite. Point and index lookups and small queries, where fixed
+per-query and per-lookup costs dominate, are within 0.7–1.7×.
 
 ### How the gap was closed (each step measured first)
 
@@ -146,6 +206,20 @@ The first version was 2–10× slower than SQLite on every query. In order:
 | PersistKV: **batched lookups** (`multiGetRaw`) for sorted row keys; fast key sort (8-byte prefixes, already-sorted runs skipped) | sorting `std::string`s cost more than the lookups; each lookup descended from the root | sorted fetches ~2× faster; index-join probes batched too |
 | Recalibrated sorted-fetch costs | the planner used an index range at 20% selectivity (6.1 ms) when a scan takes 3.4 ms | it now picks the scan |
 
+Then, for event analytics (`bench_events`, 1M events):
+
+| Change | What the profile showed | Effect |
+|---|---|---|
+| PersistKV: puts change the leaf page in place; put-only batches merge runs of keys into each leaf, and split it in place | every put decoded and re-encoded each page on its path into `Node`s (~100 allocations per level) | ingest 11.3 → ~1 µs/row; raw batched puts 18 → 0.4 µs |
+| PersistKV: slicing-by-8 CRC32; binary-search leaf merges | byte-at-a-time CRC; linear scans to find positions | WAL appends ~2.5× faster |
+| PersistKV: rarer checkpoints (32 MB / 8,192 pages) | random index inserts re-dirtied the same pages: 75 checkpoints wrote 1.4 GB for a 75 MB file | load 15.7 → 4.5 s |
+| PersistKV: dirty pages kept out of the eviction list | after a load, every cache miss walked past thousands of dirty pages | `analyze` after load 3.1 → 0.75 s |
+| Batched duplicate-key check; no row copies on insert | a hash set and one `get` per row; every row copied | 1.9 → 0.6–1.0 µs/row |
+| `analyze` with HyperLogLog and a 30K-row sample | exact hash sets (one allocation per value) and a 200K-row reservoir | 5.5 → 0.25–0.75 s |
+| Reverse scans (PersistKV `scanRawReverse`) for descending sorts | "latest 20 events of a user" fetched and sorted all of them | 11.4× → 1.1× of SQLite |
+| Vectorized `bucket()` keys, `count_distinct`, percentiles; filters applied while decoding | those aggregates ran row at a time | per-minute counts 1.36× → 0.34×, daily active users 1.05× → 0.37× |
+| Whole-valued floats stored as varints | 95% of rows stored `amount = 0.0` in 8 bytes | 74.6 → 67.2 MB |
+
 Tools used: phase timing (parse / plan / execute), layer-by-layer scan timing
 (storage → decode → cursor → operator), and minimum-of-N runs to filter out a noisy
 machine.
@@ -164,7 +238,7 @@ include/pkql, src/
   engine            statements, DDL/DML, analyze
 tools/pkql.cpp      interactive shell
 tests/              unit tests, differential test vs SQLite
-bench/              benchmark vs SQLite
+bench/              bench_events (event log) and bench_vs_sqlite (general), shared harness.h
 third_party/persist_KV   the storage engine (submodule)
 ```
 
@@ -174,3 +248,6 @@ third_party/persist_KV   the storage engine (submodule)
 - Keys are limited to 128 bytes, because of the storage engine.
 - No subqueries inside expressions, no window functions, no multi-statement transactions.
 - Vectorized execution covers scans feeding aggregates and top-N; joins, sorts and filters above them still run row at a time.
+- Reverse scans serve descending sorts over a single table or index; a descending sort over a join still sorts.
+- Timestamps are ints (ms since 1970, UTC); there is no separate time type or time-zone handling.
+- Files are about 1.6× SQLite's size for the same events.
