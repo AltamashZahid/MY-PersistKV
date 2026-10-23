@@ -123,9 +123,17 @@ void putIntFor(const std::vector<int64_t>& v, std::string& out) {
   // below the bulk (INT64_MIN, say) becomes an exception instead of moving
   // every value far from the base. Values below the base wrap around to
   // large unsigned differences and are exceptions like those far above.
-  std::vector<int64_t> sorted = v;
-  std::sort(sorted.begin(), sorted.end());
-  int64_t candidates[3] = {n ? sorted[0] : 0, n ? sorted[n / 1000] : 0, n ? sorted[n / 100] : 0};
+  // Three candidate bases: the minimum, and the 0.1% and 1% quantiles
+  // (selection, not a full sort: O(n)).
+  int64_t candidates[3] = {0, 0, 0};
+  if (n) {
+    std::vector<int64_t> sel = v;
+    candidates[0] = *std::min_element(sel.begin(), sel.end());
+    std::nth_element(sel.begin(), sel.begin() + static_cast<long>(n / 100), sel.end());
+    candidates[2] = sel[n / 100];
+    std::nth_element(sel.begin(), sel.begin() + static_cast<long>(n / 1000), sel.begin() + static_cast<long>(n / 100) + 1);
+    candidates[1] = sel[n / 1000];
+  }
   int64_t base = 0;
   int width = 64;
   double best_cost = 1e300;

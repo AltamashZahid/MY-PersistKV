@@ -1,6 +1,9 @@
 #include "pkql/engine.h"
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
+#include <mutex>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -10,6 +13,7 @@
 
 #include "pkql/codec.h"
 #include "pkql/exec.h"
+#include "pkql/parallel.h"
 #include "pkql/sketch.h"
 
 namespace pkql {
@@ -669,30 +673,58 @@ void Engine::buildBlocks(TableSchema& t) {
     cur = b.second.last_key + '\0';
   }
   if (cur < end) gaps.push_back({cur, end, false});
-  auto write = [&](std::vector<std::string>& keys, std::vector<Row>& rows) {
-    BlockMeta m;
-    std::string blob = encodeBlock(t, keys, rows, &m);
-    pkv::WriteBatch batch;
-    batch.put(blockKey(t, m.first_key), std::move(blob));
-    batch.put(blockMetaKey(t, m.first_key), serializeBlockMeta(m));
-    db_.write(batch);
-    cb->covered_rows += m.rows;
-    std::string first = m.first_key;
-    cb->by_first.emplace(std::move(first), std::move(m));
-    keys.clear();
-    rows.clear();
+  // Rows are read in key order, a few blocks' worth at a time; those blocks
+  // are encoded in parallel on the worker pool, then written in order.
+  struct Pending {
+    std::vector<std::string> keys;
+    std::vector<Row> rows;
+    BlockMeta meta;
+    std::string blob;
+  };
+  size_t threads = workerThreads();
+  std::vector<Pending> pending;
+  auto flush = [&] {
+    std::atomic<size_t> next{0};
+    std::exception_ptr error;
+    std::mutex error_mu;
+    WorkerPool::instance().run(std::min(threads, pending.size()), [&] {
+      for (size_t i; (i = next.fetch_add(1)) < pending.size();) {
+        try {
+          pending[i].blob = encodeBlock(t, pending[i].keys, pending[i].rows, &pending[i].meta);
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(error_mu);
+          if (!error) error = std::current_exception();
+        }
+      }
+    });
+    if (error) std::rethrow_exception(error);
+    for (Pending& p : pending) {
+      pkv::WriteBatch batch;
+      batch.put(blockKey(t, p.meta.first_key), std::move(p.blob));
+      batch.put(blockMetaKey(t, p.meta.first_key), serializeBlockMeta(p.meta));
+      db_.write(batch);
+      cb->covered_rows += p.meta.rows;
+      std::string first = p.meta.first_key;
+      cb->by_first.emplace(std::move(first), std::move(p.meta));
+    }
+    pending.clear();
   };
   for (const Gap& g : gaps) {
     RowCursor cursor(db_, t, g.lo, g.hi, nullptr, nullptr);
-    std::vector<std::string> keys;
-    std::vector<Row> rows;
+    Pending cur;
     Row r;
     while (cursor.next(&r)) {
-      keys.push_back(rowKey(t, r));
-      rows.push_back(r);
-      if (rows.size() == kBlockRows) write(keys, rows);
+      cur.keys.push_back(rowKey(t, r));
+      cur.rows.push_back(std::move(r));
+      r = Row();
+      if (cur.rows.size() == kBlockRows) {
+        pending.push_back(std::move(cur));
+        cur = Pending();
+        if (pending.size() == threads) flush();
+      }
     }
-    if (g.closed && !rows.empty()) write(keys, rows);
+    if (g.closed && !cur.rows.empty()) pending.push_back(std::move(cur));
+    flush();  // before the next gap's rows: blocks are written in key order
   }
   cb->gaps = false;
 }
