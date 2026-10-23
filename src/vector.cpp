@@ -37,60 +37,6 @@ Value ColumnVector::get(size_t i) const {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Batch scan: up to kBatchSize rows per call, decoded straight into columns
-// inside PersistKV's zero-copy scan callback.
-// ---------------------------------------------------------------------------
-
-class BatchScanner {
- public:
-  BatchScanner(pkv::DB& db, const TableSchema& t, std::string lo, std::string hi, const std::vector<bool>* needed)
-      : db_(db), plan_(t, needed), next_(std::move(lo)), hi_(std::move(hi)) {
-    cols.resize(t.cols.size());
-    for (size_t c = 0; c < t.cols.size(); c++) {
-      if (!needed || (*needed)[c]) cols[c].reserve(t.cols[c].type, kBatchSize);
-    }
-  }
-
-  // Decodes the next batch; returns its row count (0 = scan finished).
-  size_t next() {
-    if (done_) return 0;
-    size_t n = 0;
-    std::string last;
-    bool full = false;
-    db_.scanRaw(next_, "", [&](const char* k, size_t kl, const char* v, size_t vl) {
-      if (!hi_.empty() && hi_.compare(0, hi_.size(), k, kl) <= 0) {
-        done_ = true;
-        return false;
-      }
-      std::string_view key(k, kl), payload(v, vl);
-      key.remove_prefix(keyPrefixLength(key));
-      for (int c : plan_.key_steps) decodeKeyToColumn(key, c >= 0 ? &cols[c] : nullptr, n);
-      for (int c : plan_.payload_steps) {
-        if (payload.empty()) throw Error("corrupt row");
-        decodeValueToColumn(payload, c >= 0 ? &cols[c] : nullptr, n);
-      }
-      if (++n == kBatchSize) {
-        last.assign(k, kl);
-        full = true;
-        return false;
-      }
-      return true;
-    });
-    if (full) next_ = last + '\0';
-    else done_ = true;
-    return n;
-  }
-
-  std::vector<ColumnVector> cols;  // indexed by table column; unneeded columns stay empty
-
- private:
-  pkv::DB& db_;
-  DecodePlan plan_;
-  std::string next_, hi_;
-  bool done_ = false;
-};
-
-// ---------------------------------------------------------------------------
 // Filters: `column op constant` and `column in [constants]` run as typed
 // loops that compact a selection vector; anything else is evaluated row by
 // row on the rows that are still selected.
@@ -217,6 +163,101 @@ size_t applyKernel(const Kernel& k, const ColumnVector& col, uint32_t* sel, size
   }
 }
 
+// ---------------------------------------------------------------------------
+// Batch scan: up to kBatchSize rows per call, decoded straight into columns
+// inside PersistKV's zero-copy scan callback. Given the filter's kernels, it
+// checks each row as soon as a filtered column is decoded and drops failing
+// rows before decoding the rest of them (or copying them into the batch).
+// ---------------------------------------------------------------------------
+
+class BatchScanner {
+ public:
+  BatchScanner(pkv::DB& db, const TableSchema& t, std::string lo, std::string hi, const std::vector<bool>* needed)
+      : db_(db), plan_(t, needed), next_(std::move(lo)), hi_(std::move(hi)) {
+    cols.resize(t.cols.size());
+    for (size_t c = 0; c < t.cols.size(); c++) {
+      if (!needed || (*needed)[c]) cols[c].reserve(t.cols[c].type, kBatchSize);
+    }
+  }
+
+  // Rows failing any of these kernels are dropped while decoding.
+  void filterEarly(const std::vector<Kernel>& kernels) {
+    by_col_.assign(cols.size(), {});
+    for (const Kernel& k : kernels) by_col_[k.col].push_back(&k);
+  }
+
+  // Decodes the next batch; returns its row count (0 = scan finished).
+  size_t next() {
+    while (!done_) {
+      size_t n = scanOnce();
+      if (n > 0) return n;  // 0 rows from one call may just mean the filter dropped them all
+    }
+    return 0;
+  }
+
+  std::vector<ColumnVector> cols;  // indexed by table column; unneeded columns stay empty
+
+ private:
+  size_t scanOnce() {
+    size_t n = 0, scanned = 0;
+    std::string last;
+    bool full = false;
+    auto passes = [&](int c) {
+      if (by_col_.empty()) return true;
+      for (const Kernel* k : by_col_[c]) {
+        uint32_t one = static_cast<uint32_t>(n);
+        if (applyKernel(*k, cols[c], &one, 1) == 0) return false;
+      }
+      return true;
+    };
+    db_.scanRaw(next_, "", [&](const char* k, size_t kl, const char* v, size_t vl) {
+      if (!hi_.empty() && hi_.compare(0, hi_.size(), k, kl) <= 0) {
+        done_ = true;
+        return false;
+      }
+      // A selective filter could make one call scan far; bound the work done
+      // while PersistKV's tree lock is held.
+      if (++scanned > 16 * kBatchSize) {
+        resume_at_.assign(k, kl);  // not looked at yet: the next call starts here
+        return false;
+      }
+      std::string_view key(k, kl), payload(v, vl);
+      key.remove_prefix(keyPrefixLength(key));
+      for (int c : plan_.key_steps) {
+        decodeKeyToColumn(key, c >= 0 ? &cols[c] : nullptr, n);
+        if (c >= 0 && !passes(c)) return true;
+      }
+      for (int c : plan_.payload_steps) {
+        if (payload.empty()) throw Error("corrupt row");
+        decodeValueToColumn(payload, c >= 0 ? &cols[c] : nullptr, n);
+        if (c >= 0 && !passes(c)) return true;
+      }
+      if (++n == kBatchSize) {
+        last.assign(k, kl);
+        full = true;
+        return false;
+      }
+      return true;
+    });
+    if (!resume_at_.empty()) {
+      next_ = std::move(resume_at_);
+      resume_at_.clear();
+    } else if (full) {
+      next_ = last + '\0';
+    } else {
+      done_ = true;
+    }
+    return n;
+  }
+
+  pkv::DB& db_;
+  DecodePlan plan_;
+  std::string next_, hi_;
+  std::string resume_at_;  // set when a call stopped at its scan bound
+  bool done_ = false;
+  std::vector<std::vector<const Kernel*>> by_col_;  // early-filter kernels per column
+};
+
 // Filter state for one scan: kernels plus the conjuncts that need row-wise
 // evaluation.
 class BatchFilter {
@@ -231,12 +272,21 @@ class BatchFilter {
     }
   }
 
+  // Lets the scanner apply the kernels while decoding; apply() then only
+  // evaluates the conjuncts that are not kernels.
+  void pushKernelsInto(BatchScanner& scanner) {
+    scanner.filterEarly(kernels_);
+    kernels_in_scan_ = true;
+  }
+
   // Fills sel with the rows of the batch that pass; returns how many.
   size_t apply(const std::vector<ColumnVector>& cols, size_t n, std::vector<uint32_t>& sel) {
     sel.resize(n);
     for (size_t i = 0; i < n; i++) sel[i] = static_cast<uint32_t>(i);
     size_t m = n;
-    for (const Kernel& k : kernels_) m = applyKernel(k, cols[k.col], sel.data(), m);
+    if (!kernels_in_scan_) {
+      for (const Kernel& k : kernels_) m = applyKernel(k, cols[k.col], sel.data(), m);
+    }
     if (!generic_.empty() && m > 0) {
       size_t out = 0;
       for (size_t j = 0; j < m; j++) {
@@ -264,6 +314,7 @@ class BatchFilter {
  private:
   size_t ncols_;
   std::vector<Kernel> kernels_;
+  bool kernels_in_scan_ = false;
   std::vector<ExprPtr> generic_;
   Row row_;
 };
@@ -393,6 +444,7 @@ class VecAggregateOp : public Operator {
     tableRange(scan, &lo, &hi);
     BatchScanner scanner(ctx_.db, *scan.table, lo, hi, scan.needed.empty() ? nullptr : &scan.needed);
     BatchFilter filter(scan.pred, scan.table->cols.size());
+    filter.pushKernelsInto(scanner);
     std::vector<uint32_t> sel;
     groups_.clear();
     keys_.clear();
@@ -498,6 +550,7 @@ class VecTopNOp : public Operator {
     tableRange(scan, &lo, &hi);
     BatchScanner scanner(ctx_.db, *scan.table, lo, hi, scan.needed.empty() ? nullptr : &scan.needed);
     BatchFilter filter(scan.pred, scan.table->cols.size());
+    filter.pushKernelsInto(scanner);
     std::vector<uint32_t> sel;
     size_t k = static_cast<size_t>(std::max<int64_t>(node_.limit, 0));
     heap_.clear();
