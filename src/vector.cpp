@@ -20,7 +20,10 @@ void ColumnVector::reserve(Type t, size_t n) {
   nulls.assign(n, 1);
   if (t == Type::Int || t == Type::Bool) ints.assign(n, 0);
   if (t == Type::Float) floats.assign(n, 0);
-  if (t == Type::Text) texts.resize(n);
+  if (t == Type::Text) {
+    texts.resize(n);
+    codes.assign(n, -1);
+  }
 }
 
 Value ColumnVector::get(size_t i) const {
@@ -29,7 +32,7 @@ Value ColumnVector::get(size_t i) const {
     case Type::Int: return Value::integer(ints[i]);
     case Type::Bool: return Value::boolean(ints[i] != 0);
     case Type::Float: return Value::real(floats[i]);
-    case Type::Text: return Value::text(texts[i]);
+    case Type::Text: return Value::text(std::string(textAt(i)));
     default: return Value::null();
   }
 }
@@ -48,6 +51,10 @@ struct Kernel {
   Value lit;                // comparison constant
   std::vector<Value> list;  // `in` constants
   bool in_list = false;
+  // Text == / !=: the constant's code in the column's dictionary, looked up
+  // once (the early filter calls the kernel row by row).
+  mutable const TextDict* code_dict = nullptr;
+  mutable int32_t lit_code = -1;
 };
 
 Op flipOp(Op op) {
@@ -152,9 +159,31 @@ size_t applyKernel(const Kernel& k, const ColumnVector& col, uint32_t* sel, size
     }
     case Type::Text: {
       const std::string& c = k.lit.asText();
+      if (col.dict && (k.op == Op::Eq || k.op == Op::Ne)) {
+        // Compare codes, not strings: the constant's code is looked up once
+        // (-1 if absent, then no coded row can equal it).
+        if (k.code_dict != col.dict) {
+          k.code_dict = col.dict;
+          k.lit_code = col.dict->find(c);
+        }
+        int32_t want = k.lit_code;
+        bool eq = k.op == Op::Eq;
+        for (size_t j = 0; j < n; j++) {
+          uint32_t i = sel[j];
+          bool same;
+          if (col.nulls[i]) {
+            if (null_keep) sel[out++] = i;
+            continue;
+          }
+          int32_t code = col.codes[i];
+          same = code >= 0 ? code == want : col.texts[i] == c;
+          if (same == eq) sel[out++] = i;
+        }
+        return out;
+      }
       for (size_t j = 0; j < n; j++) {
         uint32_t i = sel[j];
-        if (col.nulls[i] ? null_keep : cmpHolds(k.op, col.texts[i].compare(c), 0)) sel[out++] = i;
+        if (col.nulls[i] ? null_keep : cmpHolds(k.op, col.textAt(i).compare(c), 0)) sel[out++] = i;
       }
       return out;
     }
@@ -177,6 +206,7 @@ class BatchScanner {
     cols.resize(t.cols.size());
     for (size_t c = 0; c < t.cols.size(); c++) {
       if (!needed || (*needed)[c]) cols[c].reserve(t.cols[c].type, kBatchSize);
+      cols[c].dict = t.dict(static_cast<int>(c));
     }
   }
 
@@ -368,7 +398,7 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
       break;
     case VFn::Min:
       if (c.type == Type::Text) {
-        if (first || c.texts[i] < s.smin) s.smin = c.texts[i];
+        if (first || c.textAt(i) < s.smin) s.smin = c.textAt(i);
       } else if (c.type == Type::Float) {
         if (first || c.floats[i] < s.fmin) s.fmin = c.floats[i];
       } else if (first || c.ints[i] < s.imin) {
@@ -377,7 +407,7 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
       break;
     case VFn::Max:
       if (c.type == Type::Text) {
-        if (first || c.texts[i] > s.smax) s.smax = c.texts[i];
+        if (first || c.textAt(i) > s.smax) s.smax = c.textAt(i);
       } else if (c.type == Type::Float) {
         if (first || c.floats[i] > s.fmax) s.fmax = c.floats[i];
       } else if (first || c.ints[i] > s.imax) {
@@ -385,7 +415,7 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
       }
       break;
     case VFn::CountDistinct:
-      if (c.type == Type::Text) s.sdistinct.insert(c.texts[i]);
+      if (c.type == Type::Text) s.sdistinct.emplace(c.textAt(i));
       else s.idistinct.insert(c.ints[i]);
       break;
     case VFn::Quantile:
@@ -468,6 +498,7 @@ class VecAggregateOp : public Operator {
     }
     std::unordered_map<int64_t, uint32_t> int_groups;
     std::unordered_map<std::string, uint32_t> text_groups;
+    std::vector<int64_t> code_groups;  // dictionary code -> group, -1 = none yet
     int64_t null_group = -1;
     uint64_t passed = 0;
 
@@ -496,9 +527,18 @@ class VecAggregateOp : public Operator {
           if (it == int_groups.end()) it = int_groups.emplace(b, newGroup(Value::integer(b))).first;
           g = it->second;
         } else if (kc.type == Type::Text) {
-          auto it = text_groups.find(kc.texts[i]);
-          if (it == text_groups.end()) it = text_groups.emplace(kc.texts[i], newGroup(kc.get(i))).first;
-          g = it->second;
+          // Dictionary-coded keys index an array by code; other text hashes.
+          int32_t code = kc.codeAt(i);
+          if (code >= 0) {
+            if (static_cast<size_t>(code) >= code_groups.size()) code_groups.resize(static_cast<size_t>(code) + 1, -1);
+            if (code_groups[code] < 0) code_groups[code] = static_cast<int64_t>(newGroup(kc.get(i)));
+            g = static_cast<uint32_t>(code_groups[code]);
+          } else {
+            std::string key(kc.textAt(i));
+            auto it = text_groups.find(key);
+            if (it == text_groups.end()) it = text_groups.emplace(key, newGroup(kc.get(i))).first;
+            g = it->second;
+          }
         } else {
           auto it = int_groups.find(kc.ints[i]);
           if (it == int_groups.end()) it = int_groups.emplace(kc.ints[i], newGroup(kc.get(i))).first;
@@ -631,7 +671,7 @@ class VecTopNOp : public Operator {
         cmp = a < b ? -1 : a > b ? 1 : 0;
       }
     } else if (c.type == Type::Text) {
-      int r = c.texts[i].compare(worst.asText());
+      int r = c.textAt(i).compare(worst.asText());
       cmp = r < 0 ? -1 : r > 0 ? 1 : 0;
     } else {
       return true;

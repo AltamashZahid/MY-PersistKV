@@ -15,6 +15,8 @@ constexpr uint8_t kNull = 0x01, kFalse = 0x02, kTrue = 0x03, kInt = 0x04, kFloat
 // Row payloads only: a float with a whole value (0.0, 12.0, ...) stored as a
 // zigzag varint, 1-3 bytes instead of 8, like SQLite stores such reals.
 constexpr uint8_t kFloatInt = 0x07;
+// Row payloads only: text stored as its code in the column's TextDict.
+constexpr uint8_t kDictText = 0x08;
 constexpr uint8_t kIntNegBase = 0x18;  // negative ints: 0x10..0x18
 constexpr uint8_t kIntPosBase = 0x19;  // non-negative ints: 0x19..0x21
 
@@ -132,6 +134,7 @@ struct ValueSink {
   void integer(int64_t x) { v->setInt(x); }
   void real(double x) { v->setFloat(x); }
   void text(const char* p, size_t n) { v->setText(p, n); }
+  void dictText(uint32_t, const std::string& s) { v->setText(s.data(), s.size()); }
 };
 
 struct ColumnSink {
@@ -154,6 +157,11 @@ struct ColumnSink {
   void text(const char* p, size_t n) {
     c->nulls[i] = 0;
     c->texts[i].assign(p, n);  // reuses the slot's buffer across batches
+    if (!c->codes.empty()) c->codes[i] = -1;
+  }
+  void dictText(uint32_t code, const std::string&) {  // only the code: the string stays in the dictionary
+    c->nulls[i] = 0;
+    c->codes[i] = static_cast<int32_t>(code);
   }
 };
 
@@ -253,7 +261,15 @@ std::string prefixSuccessor(std::string prefix) {
 
 // Row payloads: integers as zigzag varints (small numbers take 1-2 bytes),
 // text as a varint length plus bytes, floats as 8 raw bytes.
-void encodeValue(const Value& v, std::string& out) {
+void encodeValue(const Value& v, std::string& out, TextDict* dict) {
+  if (dict && v.type() == Type::Text) {
+    int32_t code = dict->codeFor(v.asText());
+    if (code >= 0) {
+      out += static_cast<char>(kDictText);
+      putVarint(static_cast<uint64_t>(code), out);
+      return;
+    }
+  }
   switch (v.type()) {
     case Type::Null: out += static_cast<char>(kNull); break;
     case Type::Bool: out += static_cast<char>(v.asBool() ? kTrue : kFalse); break;
@@ -288,7 +304,7 @@ void encodeRow(const Row& values, std::string& out) {
 namespace {
 
 template <typename Sink>
-void parseValue(std::string_view& in, Sink& out) {
+void parseValue(std::string_view& in, Sink& out, const TextDict* dict) {
   if (in.empty()) throw Error("corrupt row");
   uint8_t tag = static_cast<uint8_t>(in[0]);
   in.remove_prefix(1);
@@ -322,6 +338,13 @@ void parseValue(std::string_view& in, Sink& out) {
       if (out.active()) out.real(static_cast<double>(x));
       return;
     }
+    case kDictText: {
+      uint64_t code = getVarint(in);
+      if (!out.active()) return;  // skipping over it needs no dictionary
+      if (!dict || code >= dict->values.size()) throw Error("corrupt row: unknown dictionary code");
+      out.dictText(static_cast<uint32_t>(code), dict->values[code]);
+      return;
+    }
     case kText: {
       uint64_t n = getVarint(in);
       if (in.size() < n) throw Error("corrupt row");
@@ -336,14 +359,14 @@ void parseValue(std::string_view& in, Sink& out) {
 
 }  // namespace
 
-void decodeValue(std::string_view& in, Value* out) {
+void decodeValue(std::string_view& in, Value* out, const TextDict* dict) {
   ValueSink sink{out};
-  parseValue(in, sink);
+  parseValue(in, sink, dict);
 }
 
 void decodeValueToColumn(std::string_view& in, ColumnVector* col, size_t i) {
   ColumnSink sink{col, i};
-  parseValue(in, sink);
+  parseValue(in, sink, col ? col->dict : nullptr);
 }
 
 Row decodeRow(std::string_view in, const std::vector<bool>* keep) {

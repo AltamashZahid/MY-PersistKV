@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "persistkv/db.h"
+#include "pkql/codec.h"
 #include "pkql/value.h"
 
 namespace pkql {
@@ -50,9 +51,31 @@ struct TableSchema {
   std::vector<int> pk;  // primary key column positions, in key order
   std::vector<IndexSchema> indexes;
   TableStats stats;
+  // Per column: the dictionary of a non-key text column, else null. Shared,
+  // so copies of the schema see the same dictionary.
+  std::vector<std::shared_ptr<TextDict>> dicts;
 
   int colIndex(const std::string& col) const;  // -1 if absent
   bool isPkColumn(int col) const;
+  TextDict* dict(int col) const {
+    return static_cast<size_t>(col) < dicts.size() ? dicts[static_cast<size_t>(col)].get() : nullptr;
+  }
+};
+
+// Dictionary entries a statement adds while encoding its rows are written in
+// the same batch as those rows, so a code is never stored without its value.
+// If the statement does not commit, they are forgotten again.
+class DictTxn {
+ public:
+  explicit DictTxn(const TableSchema& t);
+  ~DictTxn();
+  void stage(pkv::WriteBatch& batch) const;  // the new entries, into the statement's batch
+  void commit() { committed_ = true; }       // call once the batch is written
+
+ private:
+  const TableSchema& t_;
+  std::vector<size_t> marks_;  // dictionary sizes when the statement began
+  bool committed_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +87,7 @@ struct TableSchema {
 //   m t <table name>                                  -> table schema
 //   m s <table id u32 BE>                             -> table statistics
 //   m n                                               -> next id
+//   m k <table id u32 BE> <column u16 BE> <code u32 BE> -> text (dictionary)
 //
 // Because the encoding is order-preserving, a table's rows are stored in
 // primary-key order and an index's entries in index-column order.
@@ -94,6 +118,7 @@ struct DecodePlan {
   std::vector<int> key_steps;      // primary-key parts, in key order
   std::vector<int> payload_steps;  // payload values, in order
   std::vector<int> unused;         // columns the query never reads (kept null)
+  std::vector<const TextDict*> payload_dicts;  // per payload step: the column's dictionary
 
   DecodePlan(const TableSchema& t, const std::vector<bool>* needed);
 };

@@ -380,6 +380,54 @@ TEST(time_ranges_use_the_key_and_stay_fresh) {
   CHECK(db.planCacheHits() > 0);
 }
 
+TEST(dictionary_encoded_text) {
+  std::string dir = freshDir("dict");
+  {
+    Engine db(dir, fast());
+    db.run("table ev (id: int key, kind: text, note: text?)");
+    std::vector<Row> rows;
+    // 6000 distinct notes overflow the 4096-entry dictionary, so later notes
+    // are stored as plain text; kinds stay coded.
+    for (int i = 0; i < 6000; i++) {
+      rows.push_back({Value::integer(i), Value::text(i % 4 ? "view" : "buy"),
+                      i % 9 == 0 ? Value::null() : Value::text("n" + std::to_string(i))});
+    }
+    db.insertRows("ev", rows);
+    // A statement that fails after encoding a new value must not keep its code.
+    CHECK_ERROR(db, "insert ev {id: 7000, kind: \"refund\"}, {id: 1, kind: \"x\"}", "duplicate key");
+    db.run("insert ev {id: 7001, kind: \"refund\", note: \"n5999\"}");
+    db.run("from ev | filter id == 2 | update kind = \"upgraded\"");
+  }
+  Engine db(dir, fast());  // dictionaries are reloaded from the store
+  const char* queries[] = {
+      "from ev | group kind { n = count() } | sort kind",
+      "from ev | filter kind == \"buy\" | aggregate { n = count() }",
+      "from ev | filter kind != \"view\" and kind != \"buy\" | select id, kind | sort id",
+      "from ev | filter note == \"n5999\" | select id | sort id",  // a plain-text value (dictionary was full)
+      "from ev | filter note == \"n4\" | select id",              // a coded one
+      "from ev | group note { n = count() } | sort -n, note | take 3",
+      "from ev | aggregate { a = min(note), b = max(note), d = count_distinct(note) }",
+      "from ev | filter note > \"n5990\" | aggregate { n = count() }",
+  };
+  for (const char* q : queries) {
+    std::string vec = db.run(q).back().format();
+    db.plannerOptions().vectorize = false;
+    std::string rowwise = db.run(q).back().format();
+    db.plannerOptions().vectorize = true;
+    CHECK(vec.substr(0, vec.rfind('(')) == rowwise.substr(0, rowwise.rfind('(')));
+  }
+  CHECK(cell(db, "from ev | filter kind == \"buy\" | aggregate { n = count() }") == "1500");  // every 4th of 6000
+  CHECK(cell(db, "from ev | filter kind == \"refund\" | aggregate { n = count() }") == "1");
+  CHECK(cell(db, "from ev | filter kind == \"upgraded\" | select id") == "2");
+  CHECK(cell(db, "from ev | filter kind == \"x\" | aggregate { n = count() }") == "0");
+  CHECK(cell(db, "from ev | filter note == \"n5999\" | aggregate { n = count() }") == "2");
+  CHECK(db.checkIntegrity().empty());
+  // Dropping the table removes its dictionary: a new table of that name starts empty.
+  db.run("drop table ev");
+  db.run("table ev (id: int key, kind: text) \n insert ev {id: 1, kind: \"fresh\"}");
+  CHECK(cell(db, "from ev | select kind") == "fresh");
+}
+
 TEST(vectorized_time_aggregates_match_row_path) {
   Engine db(freshDir("vec_time"), fast());
   db.run("table ev (id: int key, ts: int?, user_id: int, kind: text, ms: float?)");

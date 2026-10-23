@@ -413,11 +413,14 @@ Result Engine::insert(const Statement& s) {
   pkv::WriteBatch batch;
   std::vector<const Row*> ptrs;
   for (const Row& r : rows) ptrs.push_back(&r);
+  DictTxn dicts(t);
   stageInsert(t, ptrs, batch);
   TableSchema updated = t;
   updated.stats.rows += rows.size();
   catalog_.stageStats(updated, batch);
-  db_.write(batch);  // rows, index entries and the row count commit together
+  dicts.stage(batch);
+  db_.write(batch);  // rows, index entries, new dictionary codes and the row count commit together
+  dicts.commit();
   t.stats.rows = updated.stats.rows;
   return message("inserted " + plural(rows.size(), "row"));
 }
@@ -442,11 +445,14 @@ void Engine::insertRows(const std::string& name, const std::vector<Row>& rows) {
       }
     }
     pkv::WriteBatch batch;
+    DictTxn dicts(t);
     stageInsert(t, chunk, batch);
     TableSchema updated = t;
     updated.stats.rows += chunk.size();
     catalog_.stageStats(updated, batch);
+    dicts.stage(batch);
     db_.write(batch);
+    dicts.commit();
     t.stats.rows = updated.stats.rows;
   }
 }
@@ -606,6 +612,7 @@ Result Engine::modify(const Statement&, const Pipeline& p) {
       if (oi != ni) batch.remove(oi);
     }
   }
+  DictTxn dicts(t);
   for (size_t i = 0; i < rows.size(); i++) {
     batch.put(rowKey(t, new_rows[i]), rowPayload(t, new_rows[i]));
     for (const IndexSchema& ix : t.indexes) {
@@ -613,7 +620,9 @@ Result Engine::modify(const Statement&, const Pipeline& p) {
       if (oi != ni) batch.put(ni, "");
     }
   }
+  dicts.stage(batch);
   db_.write(batch);
+  dicts.commit();
   return message("updated " + plural(rows.size(), "row"));
 }
 

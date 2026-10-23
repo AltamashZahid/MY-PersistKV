@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 
+#include "pkql/codec.h"
 #include "pkql/exec.h"
 #include "pkql/value.h"
 
@@ -27,9 +28,19 @@ struct ColumnVector {
   std::vector<double> floats;
   std::vector<std::string> texts;
   std::vector<uint8_t> nulls;
+  // Dictionary-encoded text: codes[i] >= 0 means row i's value is
+  // dict->values[codes[i]] (and texts[i] is unused); -1 means it is texts[i].
+  std::vector<int32_t> codes;
+  const TextDict* dict = nullptr;
 
   void reserve(Type t, size_t n);
   Value get(size_t i) const;  // the value of row i as a Value
+  std::string_view textAt(size_t i) const {
+    return codes[i] >= 0 ? std::string_view(dict->values[static_cast<size_t>(codes[i])]) : std::string_view(texts[i]);
+  }
+  // Row i's dictionary code, also for a plain-text value that is in the
+  // dictionary; -1 if it has none.
+  int32_t codeAt(size_t i) const { return codes[i] >= 0 ? codes[i] : dict ? dict->find(texts[i]) : -1; }
 };
 
 // Typed decoders (codec.cpp): decode the next encoded value into row `i` of

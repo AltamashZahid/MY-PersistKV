@@ -28,9 +28,34 @@ const std::string kNextIdKey = "mn";
 const std::string kFormatKey = "mv";
 // 2: compact encodings (varint row values, variable-length integer keys,
 // 1-byte object ids). Databases from format 1 cannot be read.
-const std::string kFormatVersion = "3";  // 3: whole-valued floats stored as varints
+// 3: whole-valued floats stored as varints. 4: dictionary-encoded text.
+const std::string kFormatVersion = "4";
 
 std::string schemaKey(const std::string& name) { return "mt" + name; }
+
+std::string dictPrefix(uint32_t table_id) {
+  std::string k = "mk";
+  putU32(table_id, k);
+  return k;
+}
+
+std::string dictKey(uint32_t table_id, int col, uint32_t code) {
+  std::string k = dictPrefix(table_id);
+  k += static_cast<char>((col >> 8) & 0xFF);
+  k += static_cast<char>(col & 0xFF);
+  putU32(code, k);
+  return k;
+}
+
+// A dictionary for each non-key text column.
+void attachDicts(TableSchema& t) {
+  t.dicts.resize(t.cols.size());
+  for (size_t c = 0; c < t.cols.size(); c++) {
+    if (t.cols[c].type == Type::Text && !t.isPkColumn(static_cast<int>(c)) && !t.dicts[c]) {
+      t.dicts[c] = std::make_shared<TextDict>();
+    }
+  }
+}
 
 std::string statsKey(uint32_t id) {
   std::string k = "ms";
@@ -219,7 +244,7 @@ std::string rowPayload(const TableSchema& t, const Row& row) {
   std::string out;
   out.reserve(8 * t.cols.size());
   for (size_t i = 0; i < t.cols.size(); i++) {
-    if (!t.isPkColumn(static_cast<int>(i))) encodeValue(row[i], out);
+    if (!t.isPkColumn(static_cast<int>(i))) encodeValue(row[i], out, t.dict(static_cast<int>(i)));
   }
   return out;
 }
@@ -248,7 +273,7 @@ void decodeStoredRowInto(const TableSchema& t, std::string_view key, std::string
     if (payload.empty()) throw Error("corrupt row in table " + t.name);
     bool keep = !needed || (*needed)[i];
     if (!keep) row[i] = Value();
-    decodeValue(payload, keep ? &row[i] : nullptr);
+    decodeValue(payload, keep ? &row[i] : nullptr, t.dict(static_cast<int>(i)));
   }
 }
 
@@ -264,9 +289,11 @@ DecodePlan::DecodePlan(const TableSchema& t, const std::vector<bool>* needed) : 
   for (size_t i = 0; i < t.cols.size(); i++) {
     if (t.isPkColumn(static_cast<int>(i))) continue;
     payload_steps.push_back(want(static_cast<int>(i)) ? static_cast<int>(i) : -1);
+    payload_dicts.push_back(t.dict(static_cast<int>(i)));
     if (want(static_cast<int>(i))) last = payload_steps.size();
   }
   payload_steps.resize(last);  // stop after the last needed payload value
+  payload_dicts.resize(last);
   for (size_t i = 0; i < t.cols.size(); i++) {
     if (!want(static_cast<int>(i))) unused.push_back(static_cast<int>(i));
   }
@@ -276,9 +303,10 @@ void decodeStoredRowInto(const DecodePlan& plan, std::string_view key, std::stri
   if (row.size() != plan.ncols) row.assign(plan.ncols, Value());
   key.remove_prefix(prefixLength(key));  // 'r' + table id
   for (int c : plan.key_steps) decodeKeyInto(key, c >= 0 ? &row[c] : nullptr);
-  for (int c : plan.payload_steps) {
+  for (size_t s = 0; s < plan.payload_steps.size(); s++) {
+    int c = plan.payload_steps[s];
     if (payload.empty()) throw Error("corrupt row");
-    decodeValue(payload, c >= 0 ? &row[c] : nullptr);
+    decodeValue(payload, c >= 0 ? &row[c] : nullptr, plan.payload_dicts[s]);
   }
   for (int c : plan.unused) row[c].setNull();  // columns the query never reads stay null
 }
@@ -365,6 +393,19 @@ void Catalog::load() {
     auto t = std::make_unique<TableSchema>(deserializeSchema(blob));
     std::string stats;
     if (db_.get(statsKey(t->id), &stats)) t->stats = deserializeStats(stats);
+    attachDicts(*t);
+    // Dictionary entries come back in code order (the key ends in the code).
+    std::string prefix = dictPrefix(t->id);
+    db_.scan(prefix, "", [&](const std::string& k, const std::string& val) {
+      if (k.compare(0, prefix.size(), prefix) != 0) return false;
+      if (k.size() != prefix.size() + 6) throw Error("corrupt dictionary key");
+      int col = (static_cast<uint8_t>(k[prefix.size()]) << 8) | static_cast<uint8_t>(k[prefix.size() + 1]);
+      TextDict* d = t->dict(col);
+      if (!d) throw Error("dictionary for a column without one in table " + t->name);
+      d->codes.emplace(val, static_cast<uint32_t>(d->values.size()));
+      d->values.push_back(val);
+      return true;
+    });
     std::string name = t->name;
     tables_[name] = std::move(t);
   }
@@ -394,9 +435,37 @@ void Catalog::stageStats(const TableSchema& t, pkv::WriteBatch& batch) {
 void Catalog::stageDrop(const TableSchema& t, pkv::WriteBatch& batch) {
   batch.remove(schemaKey(t.name));
   batch.remove(statsKey(t.id));
+  for (size_t c = 0; c < t.dicts.size(); c++) {
+    if (!t.dicts[c]) continue;
+    for (size_t code = 0; code < t.dicts[c]->values.size(); code++) {
+      batch.remove(dictKey(t.id, static_cast<int>(c), static_cast<uint32_t>(code)));
+    }
+  }
+}
+
+DictTxn::DictTxn(const TableSchema& t) : t_(t) {
+  for (const auto& d : t.dicts) marks_.push_back(d ? d->values.size() : 0);
+}
+
+DictTxn::~DictTxn() {
+  if (committed_) return;
+  for (size_t c = 0; c < t_.dicts.size() && c < marks_.size(); c++) {
+    if (t_.dicts[c]) t_.dicts[c]->truncate(marks_[c]);
+  }
+}
+
+void DictTxn::stage(pkv::WriteBatch& batch) const {
+  for (size_t c = 0; c < t_.dicts.size() && c < marks_.size(); c++) {
+    const TextDict* d = t_.dicts[c].get();
+    if (!d) continue;
+    for (size_t code = marks_[c]; code < d->values.size(); code++) {
+      batch.put(dictKey(t_.id, static_cast<int>(c), static_cast<uint32_t>(code)), d->values[code]);
+    }
+  }
 }
 
 void Catalog::install(std::unique_ptr<TableSchema> t) {
+  attachDicts(*t);
   std::string name = t->name;
   tables_[name] = std::move(t);
 }
