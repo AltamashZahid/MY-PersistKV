@@ -10,8 +10,10 @@ cost-based optimizer and a vectorized executor. It runs on top of
 key-value store (pinned here as a git submodule). Results are checked against SQLite
 with randomized differential testing.
 
-On a 1M-event log it loads 1.3–1.6× faster than SQLite and runs time-window aggregations,
-percentiles and distinct counts 2.6–3.4× faster (see [the benchmark](#benchmark-event-analytics-vs-sqlite)).
+On a 1M-event log it loads 1.6× faster than SQLite and runs time-window aggregations,
+percentiles and distinct counts 2.3–14× faster. Against DuckDB, a column store, it is
+4–100× faster on recent-window and per-user queries and 1.5–7× slower on full-history
+scans (see [the benchmark](#benchmark-event-analytics-vs-sqlite-and-duckdb)).
 
 ```
 table events (ts: int key, user_id: int, kind: text, country: text, amount: float, latency: int)
@@ -35,7 +37,9 @@ from events | filter user_id == 42 | sort -ts | take 20        # reads the index
 | **`bucket(ts, 1h)`** | rounds a timestamp down to a bucket for time series (also correct below 1970); `time_text(ts)` formats it as UTC text. |
 | **Percentiles** | `median`, `p90`, `p95`, `p99`: exact, interpolated like SQL's `percentile_cont`. |
 | **Latest-N reads** | `sort -ts \| take 20` over a key or index range reads it **backwards** and stops after 20 rows. |
-| **Vectorized aggregation** | time-window group-bys, `count_distinct` and percentiles run over 1,024-row column batches; simple filters drop rows while they are being decoded. |
+| **Vectorized, parallel aggregation** | time-window group-bys, `count_distinct` and percentiles run over 1,024-row column batches on all cores (morsel-driven); simple filters drop rows while they are being decoded. |
+| **Dictionary-encoded text** | low-cardinality text (`kind`, `country`) is stored as small codes; filters and group-bys compare codes, not strings. |
+| **Approximate aggregates** | `approx_count_distinct` (HyperLogLog, exact up to 2,048 values) and `approx_median` / `approx_p90` / `approx_p95` / `approx_p99` (DDSketch, 1% relative error), mergeable across threads. |
 | **Fast, crash-safe ingest** | inserts are batched into WAL-logged `WriteBatch`es and merged into leaf pages in key order; 270–350K events/s with a secondary index, including `analyze`. |
 
 The query language itself:
@@ -114,7 +118,7 @@ before writing any of them, which avoids the "Halloween problem".
 
 | Test | What it checks |
 |---|---|
-| Unit tests (27) | encoding order (randomized) and float round-trips, language semantics, error messages, update/delete index maintenance (including rows swapping primary keys), atomic statements, bulk loads, time functions and percentiles, cached time ranges that must see time move, reverse scans, vectorized vs row-at-a-time results, and **which plan the optimizer chooses** for each kind of query |
+| Unit tests (30) | encoding order (randomized) and float round-trips, language semantics, error messages, update/delete index maintenance (including rows swapping primary keys), atomic statements, bulk loads, time functions and percentiles, cached time ranges that must see time move, reverse scans, dictionary encoding (reopen, rollback, full dictionaries), approximate aggregates' error bounds, parallel vs row-at-a-time results, and **which plan the optimizer chooses** for each kind of query |
 | Planner-equivalence test | every query returns identical rows under all 8 combinations of optimizer features |
 | **Differential testing against SQLite** | random data loaded into both engines; thousands of randomly generated queries (filters with `and`/`or`/`not`/`in`/`starts_with`, 2- and 3-table joins, group-bys including `bucket()` keys, `median`/`p90` against SQLite's `median`/`percentile_cont`, sort with take) written in both PKQL and SQL; results must match under 4 optimizer configurations (including row-at-a-time). **8,000 executions per run, 0 mismatches.** |
 
@@ -126,39 +130,59 @@ cd build && ./pkql_tests && ./differential_test 1000
 ./bench_events 1 /tmp/bench      # the event benchmark below (1M events)
 ```
 
-## Benchmark: event analytics vs SQLite
+## Benchmark: event analytics vs SQLite and DuckDB
 
-`bench_events`: 1M events over 7 days (5 kinds with a skewed mix, 10 countries,
-50K users of whom a few are very active, long-tailed latencies), keyed by `ts` with
-an index on `user_id`. Both engines use the same index, a 16 MB page cache, and parse
-every query fresh. SQL gets the same time cutoffs as literals. Runs alternate between
-the engines and the median of 9 is reported. Times are from the second of two runs;
-the ratio column shows both. Hardware: i5-13500H, NVMe SSD, Windows 11, g++ 16 `-O2`.
+`bench_events`: 1M events over 7 days (5 kinds with a skewed mix, 10 countries, 50K
+users of whom a few are very active, long-tailed latencies), keyed by `ts` with an
+index on `user_id`. Every engine gets the same index and parses every query fresh.
+PKQL and SQLite use a 16 MB page cache. SQL gets the same time cutoffs as literals.
+Runs alternate between the engines and the median of 9 is reported. Hardware:
+i5-13500H (12 cores), NVMe SSD, Windows 11, g++ 16 `-O2`.
 
-| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite (2 runs) | PKQL plan |
+**vs SQLite** (two runs; times from the second):
+
+| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite | PKQL plan |
 |---|---|---|---|---|
-| last hour: events by kind | 1.09 | 3.73 | **0.31× / 0.29×** | HashAggregate < TableScan [ts >= ago(1h)] |
-| last 10 minutes: events per minute | 0.20 | 0.58 | **0.36× / 0.34×** | Sort < HashAggregate (bucket) < TableScan |
-| last 6h: p95 latency by country | 8.92 | 25.39 | **0.34× / 0.35×** | HashAggregate < TableScan |
-| last 24h: top 10 users by events | 44.41 | 70.05 | **0.60× / 0.63×** | TopN < HashAggregate < TableScan |
-| 7 days: daily active users | 368.73 | 1006.25 | **0.38× / 0.37×** | Sort < HashAggregate (count_distinct) < TableScan |
-| 7 days: events and revenue by kind | 328.34 | 976.12 | **0.34× / 0.34×** | HashAggregate < TableScan |
-| 7 days: p50 / p99 latency by kind | 401.78 | 1092.31 | **0.37× / 0.37×** | HashAggregate < TableScan |
-| one user's latest 20 events (×200) | 11.79 | 11.10 | 1.13× / 1.06× | Limit < IndexScan reverse |
-| last 24h: hourly revenue from purchases | 19.95 | 15.65 | 1.24× / 1.27× | Sort < HashAggregate (bucket) < TableScan |
+| last hour: events by kind | 0.61 | 2.81 | **0.20× / 0.22×** | HashAggregate < TableScan [ts >= ago(1h)] |
+| last 10 minutes: events per minute | 0.22 | 0.63 | **0.33× / 0.35×** | Sort < HashAggregate (bucket) < TableScan |
+| last 24h: hourly revenue from purchases | 6.95 | 15.68 | **0.43× / 0.44×** | Sort < HashAggregate (bucket, parallel) < TableScan |
+| last 6h: p95 latency by country | 5.63 | 25.04 | **0.24× / 0.22×** | HashAggregate < TableScan |
+| last 24h: top 10 users by events | 49.59 | 79.19 | **0.75× / 0.63×** | TopN < HashAggregate < TableScan |
+| 7 days: daily active users | 179.54 | 915.43 | **0.20× / 0.20×** | Sort < HashAggregate (parallel) < TableScan |
+| 7 days: events and revenue by kind | 66.69 | 958.08 | **0.08× / 0.07×** | HashAggregate (parallel) < TableScan |
+| 7 days: p50 / p99 latency by kind | 129.76 | 1041.00 | **0.13× / 0.12×** | HashAggregate (parallel) < TableScan |
+| 7 days: daily active users, `approx_count_distinct` (SQLite exact) | 85.91 | 952.12 | **0.08× / 0.09×** | Sort < HashAggregate (parallel) < TableScan |
+| 7 days: `approx_median` / `approx_p99` (SQLite exact) | 78.31 | 1080.22 | **0.07× / 0.07×** | HashAggregate (parallel) < TableScan |
+| one user's latest 20 events (×200) | 13.75 | 12.41 | 1.27× / 1.11× | Limit < IndexScan reverse |
 
-| Load 1M events + analyze | PKQL | SQLite |
-|---|---|---|
-| time (2 runs) | **3.75 s / 2.84 s** | 5.06 s / 4.52 s |
-| file size | 67.2 MB | 42.2 MB |
+**vs SQLite and DuckDB 1.3.2** (one three-way run; DuckDB uses all its threads, its
+own cache, and its own approximate functions):
 
-PKQL is **2.6–3.4× faster on time-window aggregations, percentiles and distinct
-counts**, and loads faster. It is about level on a user's latest events (both read
-an index backwards) and 1.25× slower on the hourly revenue of purchases. There 95%
-of the scanned rows fail the `kind` filter, and decoding and checking `kind` costs
-PKQL about 25 ns per row (measured warm). Its files are 1.6× larger. About 14 MB of
-the 25 MB difference is per-entry overhead: a 2-byte slot, 2-byte key length and
-3-byte value header on each of the 2M entries (rows plus index entries).
+| Query | PKQL (ms) | SQLite (ms) | DuckDB (ms) | PKQL / DuckDB |
+|---|---|---|---|---|
+| one user's latest 20 events (×200) | 11.95 | 10.61 | 1252.25 | **0.01×** |
+| last 10 minutes: events per minute | 0.43 | 1.17 | 7.58 | **0.06×** |
+| last hour: events by kind | 0.72 | 3.34 | 3.01 | **0.24×** |
+| last 6h: p95 latency by country | 8.19 | 36.31 | 5.57 | 1.47× |
+| 7 days: p50 / p99 latency by kind | 137.28 | 1062.42 | 85.06 | 1.61× |
+| 7 days: approx p50 / p99 by kind | 88.70 | 1083.12 | 48.32 | 1.84× |
+| 7 days: daily active users (exact / approx) | 193.77 / 87.56 | 947.40 / 950.62 | 52.82 / 26.63 | 3.67× / 3.29× |
+| last 24h: hourly revenue from purchases | 33.42 | 22.16 | 8.84 | 3.78× |
+| last 24h: top 10 users by events | 52.73 | 66.67 | 11.47 | 4.60× |
+| 7 days: events and revenue by kind | 76.12 | 968.91 | 10.76 | 7.07× |
+
+| Load 1M events | PKQL (+ analyze) | SQLite (+ analyze) | DuckDB (+ index, checkpoint) |
+|---|---|---|---|
+| time | **2.50 s** | 3.92 s | 2.29 s |
+| file size | 59.2 MB | 42.2 MB | **21.5 MB** |
+
+**Where PKQL stands.** It beats SQLite on every event query except one user's latest
+events (about level). Against DuckDB the split follows the storage layout. PKQL's
+time-ordered B+Tree reads only the recent pages and serves "latest N for this user"
+from an index read backwards, so it is 4–100× faster on recent windows and lookups.
+DuckDB stores each column separately and compresses it. A 7-day scan reads just the
+columns it needs, packed tight, so DuckDB is 1.5–7× faster on full-history
+aggregations, and its files are 2.8× smaller.
 
 ## General benchmark vs SQLite
 
@@ -219,6 +243,11 @@ Then, for event analytics (`bench_events`, 1M events):
 | Reverse scans (PersistKV `scanRawReverse`) for descending sorts | "latest 20 events of a user" fetched and sorted all of them | 11.4× → 1.1× of SQLite |
 | Vectorized `bucket()` keys, `count_distinct`, percentiles; filters applied while decoding | those aggregates ran row at a time | per-minute counts 1.36× → 0.34×, daily active users 1.05× → 0.37× |
 | Whole-valued floats stored as varints | 95% of rows stored `amount = 0.0` in 8 bytes | 74.6 → 67.2 MB |
+| **Dictionary encoding** of text columns (Abadi et al., SIGMOD 2006); filters and group-bys on codes | `kind == "purchase"` decoded and compared strings on 95% failing rows | hourly revenue 1.25× → 1.01× of SQLite; 67.2 → 59.2 MB |
+| **Morsel-driven parallelism** (Leis et al., SIGMOD 2014): morsels cut at B+Tree separators, partitioned parallel merge | 7-day scans used one core | 7-day totals by kind 0.24× → 0.08× of SQLite |
+| PersistKV: **striped page cache**, per-reader file handles | one cache mutex, and Windows serializing reads per handle, capped scans at ~4 threads | 16-thread 7-day scan 57.7 → 29.5 ms (4.9 ms fully cached) |
+| Kahan–Babuška–Neumaier compensated sums | parallel partial sums changed the last digits | float sums independent of order |
+| **HyperLogLog** and **DDSketch** approximate aggregates (Heule et al., EDBT 2013; Masson et al., VLDB 2019) | exact distinct sets and sorted value lists per group | approx daily active users 0.20× → 0.08× of SQLite |
 
 Tools used: phase timing (parse / plan / execute), layer-by-layer scan timing
 (storage → decode → cursor → operator), and minimum-of-N runs to filter out a noisy
@@ -250,4 +279,5 @@ third_party/persist_KV   the storage engine (submodule)
 - Vectorized execution covers scans feeding aggregates and top-N; joins, sorts and filters above them still run row at a time.
 - Reverse scans serve descending sorts over a single table or index; a descending sort over a join still sorts.
 - Timestamps are ints (ms since 1970, UTC); there is no separate time type or time-zone handling.
-- Files are about 1.6× SQLite's size for the same events.
+- Files are about 1.4× SQLite's and 2.8× DuckDB's size for the same events; full-history scans are 1.5–7× slower than DuckDB's column store.
+- `PKQL_THREADS` (environment) caps the threads of parallel scans; by default, all cores up to 16.
