@@ -99,28 +99,31 @@ cd build && ./pkql_tests && ./differential_test 1000
 unindexed rows), the same indexes, a 16 MB page cache for both, and each query
 parsed fresh every time in both engines. Runs alternate between the two engines
 (PKQL, SQLite, PKQL, ...) so both see the same machine state, and the median of
-9 is reported; two full runs agreed within about 10%. Hardware: i5-13500H, NVMe SSD,
+9 is reported. Hardware: i5-13500H, NVMe SSD,
 Windows 11, g++ 16 `-O2`.
 
-| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite | PKQL plan |
-|---|---|---|---|---|
-| join all orders to products + group | 44.4 | 104.0 | **0.43× (2.3× faster)** | HashJoin < TableScan × 2 |
-| full scan + group by | 32.7 | 70.3 | **0.47× (2.1× faster)** | HashAggregate < TableScan |
-| equi-join on unindexed columns | 49.7 | 79.4 | **0.63× (1.6× faster)** | HashJoin |
-| aggregate, then join, then top 10 | 61.1 | 90.2 | **0.68× (1.5× faster)** | TopN < HashJoin < HashAggregate |
-| point lookup by primary key (×1000) | 17.0 | 14.4 | 1.18× | PointLookup (cached plan) |
-| secondary index lookup (×200) | 8.9 | 6.4 | 1.39× | IndexScan |
-| first 10 by indexed column | 0.04 | 0.02 | 1.66× | Limit < IndexScan (sort removed) |
-| top 10 by unindexed column | 19.4 | 10.5 | 1.85× | TopN < TableScan |
-| primary-key range, 5000 rows | 1.1 | 0.5 | 2.01× | TableScan (key range) |
-| selective join (city + age filter) | 2.1 | 0.7 | 3.04× | IndexJoin < IndexScan (sorted fetch) |
+Times are from the first run. The ratio column shows both runs. Absolute times move
+with machine load, so compare the ratios, which are measured interleaved.
 
-**PKQL beats SQLite on joins, aggregation and grouping** (1.5–2.3× faster). It is close
-on point and index lookups and still slower on raw scans and small selective
-queries. The remaining gap is per row: rows are decoded into tagged `Value` objects,
-one at a time (Volcano). A raw PersistKV scan costs about 11 ns per row, but decoding
-into `Value`s costs about 29 ns more. Closing that would take vectorized,
-column-at-a-time execution.
+| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite (2 runs) | PKQL plan |
+|---|---|---|---|---|
+| full scan + group by | 17.9 | 69.9 | **0.26× / 0.26× (3.8× faster)** | HashAggregate < TableScan (vectorized) |
+| aggregate, then join, then top 10 | 21.3 | 82.0 | **0.26× / 0.36× (2.8–3.8× faster)** | TopN < HashJoin < HashAggregate |
+| join all orders to products + group | 23.9 | 62.7 | **0.38× / 0.40× (2.5× faster)** | HashJoin < TableScan × 2 |
+| equi-join on unindexed columns | 38.8 | 69.8 | **0.56× / 0.64× (1.6–1.8× faster)** | HashJoin < TableScan × 2 |
+| point lookup by primary key (×1000) | 8.8 | 14.6 | **0.60× / 0.59× (1.7× faster)** | PointLookup (cached plan) |
+| primary-key range, 5000 rows | 0.4 | 0.5 | 0.89× / 1.03× | TableScan (key range) |
+| secondary index lookup (×200) | 5.3 | 5.7 | 0.93× / 0.91× | IndexScan (batched fetch) |
+| top 10 by unindexed column | 11.6 | 9.9 | 1.17× / 1.25× | TopN < TableScan (vectorized) |
+| first 10 by indexed column | < 0.1 | < 0.1 | 1.29× / 1.21× | Limit < IndexScan (sort removed) |
+| selective join (city + age filter) | 1.1 | 0.6 | 1.83× / 1.48× | IndexJoin < IndexScan (batched fetch) |
+
+**PKQL beats SQLite on scans, aggregation, joins and point lookups** (1.6–3.8×
+faster), and is level on index lookups and key ranges. It is still slower on three:
+top 10 by an unindexed column (~1.2×, SQLite's sorter is tighter than PKQL's top-N
+kernel), "first 10" (microseconds in both engines, so fixed per-query overhead
+dominates), and the selective join (1.5–1.8×: about 1,300 lookups, bound by
+PersistKV's per-lookup cost when CPU caches are cold).
 
 ### How the gap was closed (each step measured first)
 
@@ -137,6 +140,11 @@ The first version was 2–10× slower than SQLite on every query. In order:
 | Compact encoding: varint values, variable-length order-preserving integer keys, 1-byte ids | the database was 4× SQLite's size (29 MB vs 7 MB) and spilled out of the cache | 29 MB → 16 MB |
 | **Sorted index fetch** (like PostgreSQL's bitmap heap scan) | 1,000 matches meant 1,000 random lookups | one ordered pass; 0.73 vs 0.88 ms against a full scan |
 | Flat hash join; decode plans that stop at the last needed column | node allocation per build row; every column parsed | unindexed equi-join 61 → 28 ms (now faster than SQLite) |
+| **Vectorized execution**: scans feed 1,024-row column batches with selection vectors into aggregate and top-N kernels | per-row `Value` decoding and virtual calls | full scan + group by 0.47× → 0.26× of SQLite |
+| PersistKV: array page table; zero-copy `getRaw` decoding rows straight from the cached page | a hash-map probe per page and a row copy per lookup | random lookup ~0.8 → ~0.6 µs; point lookups 0.85× → 0.6× |
+| Index entries read in place; row keys built in the scan callback | each index entry was copied into two strings and decoded into `Value`s | the Pune users scan ~0.55 → ~0.38 ms |
+| PersistKV: **batched lookups** (`multiGetRaw`) for sorted row keys; fast key sort (8-byte prefixes, already-sorted runs skipped) | sorting `std::string`s cost more than the lookups; each lookup descended from the root | sorted fetches ~2× faster; index-join probes batched too |
+| Recalibrated sorted-fetch costs | the planner used an index range at 20% selectivity (6.1 ms) when a scan takes 3.4 ms | it now picks the scan |
 
 Tools used: phase timing (parse / plan / execute), layer-by-layer scan timing
 (storage → decode → cursor → operator), and minimum-of-N runs to filter out a noisy
@@ -165,4 +173,4 @@ third_party/persist_KV   the storage engine (submodule)
 - Writers are serialized (one statement at a time per engine).
 - Keys are limited to 128 bytes, because of the storage engine.
 - No subqueries inside expressions, no window functions, no multi-statement transactions.
-- Row-at-a-time execution over tagged `Value`s (see the benchmark); no vectorized execution yet.
+- Vectorized execution covers scans feeding aggregates and top-N; joins, sorts and filters above them still run row at a time.
