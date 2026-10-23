@@ -13,8 +13,9 @@ with randomized differential testing.
 On a 1M-event log, run against each engine alone in its own process, PKQL is faster
 than **DuckDB** on 9 of 11 event queries: 3–70× on recent windows, ~65× on a user's
 latest events, 1.1–4× on 7-day percentiles and distinct counts. It ties on a 7-day
-group-by and loses on one high-cardinality top-N (1.4–2×). It is 7–100× faster than
-**SQLite** and 2.8–230× faster than **CockroachDB** on the same queries. DuckDB loads
+group-by and loses on one high-cardinality top-N (1.4–2×). It is 3–100× faster than
+**SQLite** on 10 of the 11 (1.2× slower on a user's latest events) and 2.8–230× faster
+than **CockroachDB**. DuckDB loads
 2.7× faster, and its files are 3× smaller. See
 [the benchmark](#benchmark-event-analytics-vs-duckdb-sqlite-and-cockroachdb).
 
@@ -184,7 +185,7 @@ page cache. DuckDB manages its own memory and uses all cores, as PKQL does.
 
 **vs CockroachDB v25.2.4** (single node, the same CSV loaded by
 `bench/bench_cockroach.py`; timed from a Python client over localhost, so each query
-includes a round trip):
+includes a round trip; PKQL's times from a run before column blocks):
 
 | Query | CockroachDB (ms) | PKQL / CockroachDB |
 |---|---|---|
@@ -193,7 +194,7 @@ includes a round trip):
 | last 6h: p95 latency by country | 60.75 | 0.12× |
 | last 24h: top 10 users by events | 160.37 | 0.35× |
 | one user's latest 20 events (×200) | 2766.16 | 0.004× |
-| 7 days: daily active users | 1294.28 | 0.13× |
+| 7 days: daily active users | 1294.28 | 0.15× |
 | 7 days: events and revenue by kind | 1365.67 | 0.06× |
 
 CockroachDB is built for something else: transactions replicated across machines.
