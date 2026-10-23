@@ -369,13 +369,13 @@ TEST(percentile_aggregates) {
 TEST(time_ranges_use_the_key_and_stay_fresh) {
   Engine db(freshDir("time_range"), fast());
   db.run("table ev (ts: int key, kind: text)");
-  db.run("insert ev {ts: now() - 2h, kind: \"old\"}, {ts: now() - 10m, kind: \"new\"}, {ts: now() + 400ms, kind: \"soon\"}");
+  db.run("insert ev {ts: now() - 2h, kind: \"old\"}, {ts: now() - 10m, kind: \"new\"}, {ts: now() + 1s, kind: \"soon\"}");
   // ago() becomes a primary-key range, so only recent rows are read.
   CHECK(has(plan(db, "from ev | filter ts >= ago(1h) | aggregate { n = count() }"), "TableScan ev [ts >= ago(1h)]"));
   CHECK(cell(db, "from ev | filter ts >= ago(1h) and ts <= now() | aggregate { n = count() }") == "1");
   // The same query again runs from the plan cache, which must use the
   // current time, not the time it was planned at.
-  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1300));  // margins for slow (sanitizer) builds
   CHECK(cell(db, "from ev | filter ts >= ago(1h) and ts <= now() | aggregate { n = count() }") == "2");
   CHECK(db.planCacheHits() > 0);
 }

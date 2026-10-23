@@ -37,6 +37,10 @@ std::mt19937 lrng;  // literal values, so one shape can be re-run with other con
 
 int pick(int n) { return static_cast<int>(rng() % static_cast<unsigned>(n)); }
 
+// median() and percentile_cont() exist in SQLite 3.47+ only; older builds
+// (e.g. Ubuntu 24.04's) skip the percentile checks.
+bool sqlite_has_percentiles = false;
+
 const char* kCities[] = {"Pune", "Delhi", "Mumbai", "Chennai", "Agra", "Goa"};
 const char* kStatus[] = {"open", "paid", "shipped", "returned"};
 const char* kCategory[] = {"books", "games", "garden", "tools", "toys"};
@@ -312,7 +316,7 @@ Query generate(const std::vector<Tab>& tabs) {
     select_sql = key_sql + ", count(*), sum(" + m.q() + "), min(" + m.q() + "), max(" + m.q() + ")";
     out_pkql = {key_name, "n", "s", "lo", "hi"};
     out_sql = {"1", "2", "3", "4", "5"};
-    if (pick(3) == 0) {  // percentiles, checked against SQLite's median / percentile_cont
+    if (sqlite_has_percentiles && pick(3) == 0) {  // percentiles, checked against SQLite's median / percentile_cont
       q.pkql += ", md = median(" + m.q() + "), q9 = p90(" + m.q() + ")";
       select_sql += ", median(" + m.q() + "), percentile_cont(" + m.q() + ", 0.9)";
       out_pkql.push_back("md");
@@ -373,6 +377,12 @@ int main(int argc, char** argv) {
   Engine pk(dir, o);
   sqlite3* sq = nullptr;
   sqlite3_open(":memory:", &sq);
+  sqlite3_stmt* probe = nullptr;
+  sqlite_has_percentiles = sqlite3_prepare_v2(sq, "select median(1), percentile_cont(1, 0.5)", -1, &probe, nullptr) == SQLITE_OK;
+  sqlite3_finalize(probe);
+  if (!sqlite_has_percentiles) {
+    std::cout << "note: SQLite " << sqlite3_libversion() << " has no percentile_cont; percentile checks skipped\n";
+  }
 
   std::vector<Tab> tabs = buildData(pk, sq);
 
