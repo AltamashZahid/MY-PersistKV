@@ -162,6 +162,23 @@ TEST(key_encoding_preserves_order) {
 
 // --- Language semantics --------------------------------------------------------
 
+TEST(row_encoding_round_trips_floats) {
+  // Whole-valued floats take the short varint form; everything else 8 bytes.
+  const double values[] = {0.0, -0.0, 3.0, -7.0, 9007199254740991.0, 9007199254740992.0, 1e300, -1e-300, 0.5,
+                           -123456789.25};
+  for (double d : values) {
+    std::string out;
+    encodeRow({Value::real(d)}, out);
+    Row back = decodeRow(out);
+    CHECK(back.size() == 1 && back[0].type() == Type::Float);
+    double b = back.empty() ? 1.0 : back[0].asFloat();
+    CHECK(std::memcmp(&d, &b, 8) == 0);  // bit-exact, including -0.0
+  }
+  std::string zero;
+  encodeRow({Value::real(0.0)}, zero);
+  CHECK(zero.size() == 2);  // tag + one varint byte, not tag + 8
+}
+
 TEST(nulls_are_ordinary_values) {
   Engine db(freshDir("nulls"), fast());
   db.run(R"(

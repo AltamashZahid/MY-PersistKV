@@ -28,7 +28,7 @@ const std::string kNextIdKey = "mn";
 const std::string kFormatKey = "mv";
 // 2: compact encodings (varint row values, variable-length integer keys,
 // 1-byte object ids). Databases from format 1 cannot be read.
-const std::string kFormatVersion = "2";
+const std::string kFormatVersion = "3";  // 3: whole-valued floats stored as varints
 
 std::string schemaKey(const std::string& name) { return "mt" + name; }
 

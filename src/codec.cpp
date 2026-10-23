@@ -2,6 +2,7 @@
 
 #include "pkql/vector.h"
 
+#include <cmath>
 #include <cstring>
 
 namespace pkql {
@@ -11,6 +12,9 @@ namespace {
 // Tags. Integers in keys use a range of tags that also encodes their sign
 // and byte length (see encodeKey); 0x04 is the integer tag in row payloads.
 constexpr uint8_t kNull = 0x01, kFalse = 0x02, kTrue = 0x03, kInt = 0x04, kFloat = 0x05, kText = 0x06;
+// Row payloads only: a float with a whole value (0.0, 12.0, ...) stored as a
+// zigzag varint, 1-3 bytes instead of 8, like SQLite stores such reals.
+constexpr uint8_t kFloatInt = 0x07;
 constexpr uint8_t kIntNegBase = 0x18;  // negative ints: 0x10..0x18
 constexpr uint8_t kIntPosBase = 0x19;  // non-negative ints: 0x19..0x21
 
@@ -258,8 +262,14 @@ void encodeValue(const Value& v, std::string& out) {
       putVarint(zigzag(v.asInt()), out);
       break;
     case Type::Float: {
-      out += static_cast<char>(kFloat);
       double d = v.asFloat();
+      // Whole values below 2^53 round-trip exactly; -0.0 keeps its sign bit.
+      if (d == std::floor(d) && std::fabs(d) < 9007199254740992.0 && !(d == 0 && std::signbit(d))) {
+        out += static_cast<char>(kFloatInt);
+        putVarint(zigzag(static_cast<int64_t>(d)), out);
+        break;
+      }
+      out += static_cast<char>(kFloat);
       out.append(reinterpret_cast<const char*>(&d), 8);
       break;
     }
@@ -305,6 +315,11 @@ void parseValue(std::string_view& in, Sink& out) {
         out.real(d);
       }
       in.remove_prefix(8);
+      return;
+    }
+    case kFloatInt: {
+      int64_t x = unzigzag(getVarint(in));
+      if (out.active()) out.real(static_cast<double>(x));
       return;
     }
     case kText: {
