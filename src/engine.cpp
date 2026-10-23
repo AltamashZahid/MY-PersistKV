@@ -1,6 +1,7 @@
 #include "pkql/engine.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -16,7 +17,10 @@ namespace {
 
 constexpr size_t kLoadChunk = 2000;
 constexpr size_t kHistogramBuckets = 64;
-constexpr size_t kAnalyzeSample = 200000;
+// Rows sampled for histograms: 30,000, as PostgreSQL's default (300 x its
+// statistics target) for a similar bucket count. Larger samples barely
+// change the bounds but copy and sort far more values.
+constexpr size_t kAnalyzeSample = 30000;
 
 Result message(std::string m) {
   Result r;
@@ -617,14 +621,60 @@ Result Engine::modify(const Statement&, const Pipeline& p) {
 // Statistics
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// HyperLogLog estimate of a column's distinct values: 2^14 one-byte
+// registers (16 KB, about 0.8% error), with linear counting for small sets,
+// where it is nearly exact. An exact hash set cost one allocation per value.
+class DistinctEstimator {
+ public:
+  void add(uint64_t h) {
+    h = mix(h);
+    size_t idx = static_cast<size_t>(h >> (64 - kBits));
+    uint64_t rest = (h << kBits) | (1ull << (kBits - 1));  // a guard bit bounds the rank
+    uint8_t rank = static_cast<uint8_t>(std::countl_zero(rest) + 1);
+    if (rank > reg_[idx]) reg_[idx] = rank;
+  }
+  uint64_t estimate() const {
+    double sum = 0;
+    size_t zeros = 0;
+    for (uint8_t r : reg_) {
+      sum += std::ldexp(1.0, -r);
+      zeros += r == 0;
+    }
+    double m = static_cast<double>(kM);
+    double e = 0.7213 / (1 + 1.079 / m) * m * m / sum;
+    if (e <= 2.5 * m && zeros > 0) e = m * std::log(m / static_cast<double>(zeros));
+    return static_cast<uint64_t>(std::llround(e));
+  }
+
+ private:
+  static constexpr int kBits = 14;
+  static constexpr size_t kM = size_t{1} << kBits;
+  static uint64_t mix(uint64_t x) {  // splitmix64 finalizer: std::hash of an int is the identity
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+  }
+  std::vector<uint8_t> reg_ = std::vector<uint8_t>(kM, 0);
+};
+
+}  // namespace
+
 void Engine::analyzeTable(TableSchema& t) {
   size_t ncols = t.cols.size();
-  std::vector<std::unordered_set<size_t>> distinct(ncols);  // value hashes: an exact-enough ndv
+  std::vector<DistinctEstimator> distinct(ncols);
   std::vector<std::vector<Value>> sample(ncols);
   std::vector<uint64_t> nulls(ncols, 0);
   uint64_t rows = 0;
   uint64_t rng = 0x9e3779b97f4a7c15ull;
-  forEachRow(db_, t, [&](const std::string&, const Row& row) {
+  // Rows are decoded in place from the store into one reused buffer.
+  std::string prefix = tablePrefix(t.id);
+  RowCursor cursor(db_, t, prefix, prefixSuccessor(prefix), nullptr, nullptr);
+  Row row;
+  while (cursor.next(&row)) {
     rows++;
     // Reservoir sampling keeps a uniform sample for the histograms.
     rng ^= rng << 13;
@@ -636,18 +686,18 @@ void Engine::analyzeTable(TableSchema& t) {
         nulls[c]++;
         continue;
       }
-      distinct[c].insert(row[c].hash());
+      distinct[c].add(row[c].hash());
       if (sample[c].size() < kAnalyzeSample) sample[c].push_back(row[c]);
       else if (slot < kAnalyzeSample) sample[c][slot] = row[c];
     }
-  });
+  }
 
   TableStats st;
   st.rows = rows;
   st.analyzed = true;
   for (size_t c = 0; c < ncols; c++) {
     ColumnStats cs;
-    cs.ndv = distinct[c].size();
+    cs.ndv = std::min(distinct[c].estimate(), rows - nulls[c]);
     cs.nulls = nulls[c];
     std::vector<Value>& v = sample[c];
     std::sort(v.begin(), v.end(), [](const Value& a, const Value& b) { return compare(a, b) < 0; });
