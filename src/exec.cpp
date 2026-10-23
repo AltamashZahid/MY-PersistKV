@@ -99,6 +99,15 @@ class KeyReader {
       startSortedFetchIfCheaper(std::move(lo), hi);
       return;
     }
+    // A join probe with equality on every index column finds row keys that
+    // are already in index order, so it can fetch them in batches without
+    // changing its output order.
+    if (p_.kind == PKind::IndexJoin && eq.size() == p_.index->cols.size()) {
+      std::vector<std::string> keys;
+      collectRowKeys(db_, *p_.table, *p_.index, std::move(lo), hi, &keys);
+      startBatchedFetch(std::move(keys));
+      return;
+    }
     cursor_ = std::make_unique<Cursor>(db_, lo, hi);
   }
 
@@ -112,10 +121,7 @@ class KeyReader {
     sortKeys(keys);
     double table_rows = static_cast<double>(p_.table->stats.rows);
     if (static_cast<double>(keys.size()) * kBatchedLookupVsSkip < table_rows) {
-      pending_keys_ = std::move(keys);  // look the matches up in key order, a batch at a time
-      pending_pos_ = 0;
-      batched_ = true;
-      batch_size_ = 16;
+      startBatchedFetch(std::move(keys));
       return;
     }
     std::string prefix = tablePrefix(p_.table->id);
@@ -157,6 +163,14 @@ class KeyReader {
 
  private:
   const std::vector<bool>* needed() const { return p_.needed.empty() ? nullptr : &p_.needed; }
+
+  // Looks the row keys (sorted) up a batch at a time.
+  void startBatchedFetch(std::vector<std::string> keys) {
+    pending_keys_ = std::move(keys);
+    pending_pos_ = 0;
+    batched_ = true;
+    batch_size_ = 16;
+  }
 
   // Looks up the next batch of sorted row keys with one batched storage call
   // and keeps the decoded rows that pass the filter.
@@ -345,7 +359,10 @@ class HashJoinOp : public Operator {
 class IndexJoinOp : public Operator {
  public:
   IndexJoinOp(PNode& n, std::unique_ptr<Operator> outer, ExecContext& ctx)
-      : Operator(n), outer_(std::move(outer)), reader_(ctx.db, n) {}
+      : Operator(n), outer_(std::move(outer)), reader_(ctx.db, n) {
+    const std::vector<int>& cols = node_.index ? node_.index->cols : node_.table->pk;
+    prefix_.assign(cols.begin(), cols.begin() + static_cast<long>(node_.eq.size()));
+  }
 
   void open() override {
     outer_->open();
@@ -353,21 +370,19 @@ class IndexJoinOp : public Operator {
   }
 
   bool next(Row* row) override {
-    const std::vector<int>& cols = node_.index ? node_.index->cols : node_.table->pk;
-    std::vector<int> prefix(cols.begin(), cols.begin() + static_cast<long>(node_.eq.size()));
     while (true) {
       if (!have_outer_) {
         if (!outer_->next(&cur_)) return false;
         have_outer_ = true;
         matched_ = false;
-        reader_.start(evalAll(node_.eq, cur_, node_.table, &prefix), cur_);
+        reader_.start(evalAll(node_.eq, cur_, node_.table, &prefix_), cur_);
       }
-      Row inner;
-      while (reader_.next(&inner)) {
-        Row out = concat(cur_, inner);
-        if (!node_.pred || isTrue(eval(*node_.pred, out))) {
+      while (reader_.next(&inner_)) {
+        // Written into the caller's buffer, reusing its storage.
+        row->assign(cur_.begin(), cur_.end());
+        row->insert(row->end(), inner_.begin(), inner_.end());
+        if (!node_.pred || isTrue(eval(*node_.pred, *row))) {
           matched_ = true;
-          *row = std::move(out);
           return true;
         }
       }
@@ -382,7 +397,8 @@ class IndexJoinOp : public Operator {
  private:
   std::unique_ptr<Operator> outer_;
   KeyReader reader_;
-  Row cur_;
+  std::vector<int> prefix_;  // the key columns the probe's equalities fix
+  Row cur_, inner_;
   bool have_outer_ = false, matched_ = false;
 };
 
@@ -693,6 +709,14 @@ void tableScanRange(const PNode& p, std::string* lo, std::string* hi) {
   keyRange(tablePrefix(p.table->id), evalAll(p.eq, Row(), p.table, &prefix), p, Row(), lo, hi);
 }
 
+bool isIdentityProject(const PNode& p) {
+  if (p.exprs.size() != p.kids[0]->schema.size()) return false;
+  for (size_t i = 0; i < p.exprs.size(); i++) {
+    if (p.exprs[i]->kind != ExprKind::Column || p.exprs[i]->index != static_cast<int>(i)) return false;
+  }
+  return true;
+}
+
 std::unique_ptr<Operator> buildOperator(PNode& p, ExecContext& ctx) {
   auto kid = [&](size_t i) { return buildOperator(*p.kids[i], ctx); };
   std::unique_ptr<Operator> op;
@@ -705,7 +729,12 @@ std::unique_ptr<Operator> buildOperator(PNode& p, ExecContext& ctx) {
     case PKind::TableScan:
     case PKind::IndexScan: op = std::make_unique<ScanOp>(p, ctx); break;
     case PKind::Filter: op = std::make_unique<FilterOp>(p, kid(0)); break;
-    case PKind::Project: op = std::make_unique<ProjectOp>(p, kid(0)); break;
+    case PKind::Project:
+      // A projection that passes every column through unchanged is skipped
+      // (kept under explain analyze so the plan shape matches the output).
+      if (!ctx.analyze && isIdentityProject(p)) return kid(0);
+      op = std::make_unique<ProjectOp>(p, kid(0));
+      break;
     case PKind::HashJoin: op = std::make_unique<HashJoinOp>(p, kid(0), kid(1)); break;
     case PKind::IndexJoin: op = std::make_unique<IndexJoinOp>(p, kid(0), ctx); break;
     case PKind::NestedLoopJoin: op = std::make_unique<NestedLoopJoinOp>(p, kid(0), kid(1)); break;
