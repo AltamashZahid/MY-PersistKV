@@ -557,7 +557,7 @@ bool isPlainColumn(const ExprPtr& e) { return e && e->kind == ExprKind::Column; 
 bool vectorizable(const PNode& p) {
   if (p.kids.size() != 1) return false;
   const PNode& scan = *p.kids[0];
-  if (scan.kind != PKind::TableScan || scan.point || scan.index) return false;
+  if (scan.kind != PKind::TableScan || scan.point || scan.index || scan.reverse) return false;
   if (p.kind == PKind::HashAggregate) {
     if (p.exprs.size() > 1) return false;
     if (p.exprs.size() == 1) {

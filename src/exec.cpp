@@ -91,6 +91,7 @@ class KeyReader {
     keyRange(p_.index ? indexPrefix(p_.index->id) : tablePrefix(p_.table->id), eq, p_, ctx_row, &lo, &hi);
     if (!p_.index) {
       rows_ = std::make_unique<RowCursor>(db_, *p_.table, lo, hi, needed(), pred);
+      if (p_.reverse) rows_->setReverse();
       return;
     }
     // A sorted fetch returns rows in primary-key order, so it is only used
@@ -109,6 +110,7 @@ class KeyReader {
       return;
     }
     cursor_ = std::make_unique<Cursor>(db_, lo, hi);
+    if (p_.reverse) cursor_->setReverse();
   }
 
   // Sorted index fetch (like a bitmap heap scan): collect the matching row

@@ -153,13 +153,15 @@ class Cursor {
       : db_(db), next_(std::move(lo)), hi_(std::move(hi_exclusive)) {}
 
   bool next(std::string* key, std::string* value);
+  void setReverse() { reverse_ = true; }  // newest-first; call before next()
 
  private:
   void fill();
 
   pkv::DB& db_;
-  std::string next_;  // first key of the next chunk
-  std::string hi_;    // exclusive; empty = unbounded
+  std::string next_;  // first key of the next chunk (reverse: the fixed lower bound)
+  std::string hi_;    // exclusive; empty = unbounded (reverse: moves down after each chunk)
+  bool reverse_ = false;
   std::vector<std::pair<std::string, std::string>> buf_;
   size_t pos_ = 0;
   size_t chunk_ = 16;  // grows to kCursorChunk
@@ -189,13 +191,17 @@ class RowCursor {
     keys_ = std::move(keys);
     use_keys_ = true;
   }
+  // Rows newest-first (descending key order); call before next(). Not
+  // combined with onlyKeys.
+  void setReverse() { reverse_ = true; }
 
  private:
   void fill();
 
   pkv::DB& db_;
   const TableSchema& t_;
-  std::string next_, hi_;
+  std::string next_, hi_;  // reverse: next_ is the fixed lower bound, hi_ moves down
+  bool reverse_ = false;
   const std::vector<bool>* needed_;
   const Expr* pred_;
   DecodePlan plan_;

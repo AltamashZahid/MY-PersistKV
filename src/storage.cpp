@@ -413,6 +413,15 @@ void Cursor::fill() {
   // for long scans.
   size_t chunk = chunk_;
   chunk_ = std::min(chunk_ * 4, kCursorChunk);
+  if (reverse_) {
+    db_.scanRawReverse(next_, hi_, [&](const char* k, size_t kl, const char* v, size_t vl) {
+      buf_.emplace_back(std::string(k, kl), std::string(v, vl));
+      return buf_.size() < chunk;
+    });
+    if (buf_.size() < chunk) done_ = true;
+    if (!buf_.empty()) hi_ = buf_.back().first;  // the next chunk ends just below the last key
+    return;
+  }
   db_.scanRaw(next_, "", [&](const char* k, size_t kl, const char* v, size_t vl) {
     if (!hi_.empty() && hi_.compare(0, hi_.size(), k, kl) <= 0) {
       done_ = true;
@@ -431,6 +440,28 @@ void RowCursor::fill() {
   if (done_) return;
   size_t want = chunk_;
   chunk_ = std::min<size_t>(chunk_ * 4, 1024);
+  if (reverse_) {
+    // Newest-first: the same decode and filter, with the upper bound moving
+    // down to the last key looked at.
+    size_t scanned = 0, max_scan = std::max<size_t>(want * 8, 4096);
+    std::string last;
+    bool stopped_early = false;
+    db_.scanRawReverse(next_, hi_, [&](const char* k, size_t kl, const char* v, size_t vl) {
+      if (count_ == buf_.size()) buf_.emplace_back();
+      Row& row = buf_[count_];
+      decodeStoredRowInto(plan_, std::string_view(k, kl), std::string_view(v, vl), row);
+      if (!pred_ || isTrue(eval(*pred_, row))) count_++;
+      if (count_ >= want || ++scanned >= max_scan) {
+        last.assign(k, kl);
+        stopped_early = true;
+        return false;
+      }
+      return true;
+    });
+    if (stopped_early) hi_ = last;  // exclusive: resume just below it
+    else done_ = true;
+    return;
+  }
   // Bound the work per scan call (the scan holds PersistKV's tree lock),
   // even when the filter rejects almost every row.
   size_t scanned = 0, max_scan = std::max<size_t>(want * 8, 4096);

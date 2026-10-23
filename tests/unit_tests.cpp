@@ -363,6 +363,32 @@ TEST(time_ranges_use_the_key_and_stay_fresh) {
   CHECK(db.planCacheHits() > 0);
 }
 
+TEST(descending_sorts_read_scans_backwards) {
+  Engine db(freshDir("reverse"), fast());
+  db.run("table ev (ts: int key, user_id: int, kind: text) \n index ev_user on ev (user_id)");
+  std::vector<Row> rows;
+  for (int i = 0; i < 5000; i++) rows.push_back({Value::integer(i * 10), Value::integer(i % 7), Value::text(i % 3 ? "view" : "buy")});
+  db.insertRows("ev", rows);
+  db.run("analyze");
+  // Latest events: the table scan runs backwards and stops after 3 rows.
+  CHECK(has(plan(db, "from ev | sort -ts | take 3"), "TableScan ev (full) reverse"));
+  CHECK(cell(db, "from ev | sort -ts | take 3 | aggregate { s = sum(ts) }") == std::to_string(49990 + 49980 + 49970));
+  // One user's latest events: the index on user_id (whose entries end in ts) backwards.
+  CHECK(has(plan(db, "from ev | filter user_id == 3 | sort -ts | take 2"), "IndexScan ev.ev_user [user_id == 3] reverse"));
+  CHECK(cell(db, "from ev | filter user_id == 3 | sort -ts | take 1 | select ts") == "49940");
+  // A key range with a residual filter, read backwards across many chunks.
+  CHECK(cell(db, "from ev | filter ts >= 1000 and ts < 40000 and kind == \"buy\" | sort -ts | take 1 | select ts") ==
+        "39990");
+  std::vector<Result> all = db.run("from ev | filter ts < 30000 | sort -ts | select ts");
+  bool descending = all.back().rows.size() == 3000;
+  for (size_t i = 0; descending && i < all.back().rows.size(); i++) {
+    descending = all.back().rows[i][0].asInt() == static_cast<int64_t>(29990 - 10 * i);
+  }
+  CHECK(descending);
+  // Mixed directions still sort.
+  CHECK(!has(plan(db, "from ev | sort user_id, -ts | take 3"), "reverse"));
+}
+
 // --- Optimizer -------------------------------------------------------------------
 
 TEST(access_path_selection) {

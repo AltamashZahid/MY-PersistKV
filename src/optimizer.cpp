@@ -896,23 +896,54 @@ void markOrderNeeded(PNode& p) {
   }
 }
 
+// A chain of filters and projections over one table or index scan: reading
+// that scan backwards reverses the chain's output order.
+bool reversible(const PNode& p) {
+  switch (p.kind) {
+    case PKind::Filter:
+    case PKind::Project: return reversible(*p.kids[0]);
+    case PKind::TableScan: return !p.point;
+    case PKind::IndexScan: return true;
+    default: return false;
+  }
+}
+
+// Reads the chain's scan backwards. Its outputs are then in descending
+// order, which `order` (ascending by definition) cannot describe.
+void markReverse(PNode& p) {
+  p.order.clear();
+  if (p.kind == PKind::Filter || p.kind == PKind::Project) markReverse(*p.kids[0]);
+  else p.reverse = true;
+}
+
 PPtr Planner::planSort(const LPtr& sort, const LPtr& limit) {
   const LPtr& in = sort->kids[0];
   std::vector<int> wanted;
   bool simple = opts_.use_interesting_orders;
+  // All keys ascending, or all descending (served by a scan read backwards,
+  // e.g. `sort -ts | take 20` for the latest events).
+  bool asc = false, desc = false;
   for (const SortSpec& s : sort->sort) {
-    if (s.desc || s.expr->kind != ExprKind::Column) simple = false;
+    if (s.expr->kind != ExprKind::Column) simple = false;
     else wanted.push_back(s.expr->index);
+    (s.desc ? desc : asc) = true;
   }
+  if (asc && desc) simple = false;
+  bool reverse = desc;
+  auto usable = [&](const PNode& p) { return startsWith(p.order, wanted) && (!reverse || reversible(p)); };
+  auto take = [&](PPtr p) {
+    markOrderNeeded(*p);
+    if (reverse) markReverse(*p);
+    return p;
+  };
 
   PPtr any = plan(in);
   int64_t k = limit ? (limit->limit < 0 ? -1 : limit->limit + limit->offset) : -1;
 
   // Option A: sort (or top-N) the cheapest input.
   PPtr sorted;
-  if (simple && startsWith(any->order, wanted)) {
-    sorted = any;  // already in order
-    markOrderNeeded(*sorted);
+  if (simple && usable(*any)) {
+    sorted = take(any);  // already in order (or in reverse order, read backwards)
   } else {
     sorted = makeP(k >= 0 ? PKind::TopN : PKind::Sort);
     sorted->kids = {any};
@@ -924,23 +955,20 @@ PPtr Planner::planSort(const LPtr& sort, const LPtr& limit) {
     sorted->cost = any->cost + work;
     sorted->startup = sorted->cost;
     sorted->cols = any->cols;
-    sorted->order = simple ? wanted : std::vector<int>();
+    sorted->order = simple && !reverse ? wanted : std::vector<int>();
   }
 
   // Option B: an input that already arrives in the wanted order, e.g. an
   // index on the sort column. With a limit it can stop after k rows.
   if (simple) {
     PPtr ordered = plan(in, &wanted);
-    if (startsWith(ordered->order, wanted)) {
+    if (usable(*ordered)) {
       double cost_a = sorted->cost, cost_b = ordered->cost;
       if (k >= 0) {
         double frac = std::min(1.0, static_cast<double>(k) / std::max(1.0, ordered->rows));
         cost_b = ordered->startup + (ordered->cost - ordered->startup) * frac;
       }
-      if (cost_b < cost_a) {
-        sorted = ordered;
-        markOrderNeeded(*sorted);
-      }
+      if (cost_b < cost_a) sorted = take(ordered);
     }
   }
   return sorted;
@@ -1133,6 +1161,7 @@ std::string describe(const PNode& p) {
       s += p.table->name;
       std::string k = keyCondition(p);
       s += k.empty() ? " (full)" : " [" + k + "]";
+      if (p.reverse) s += " reverse";
       if (p.pred) s += " filter " + toString(*p.pred);
       return s;
     }
@@ -1140,6 +1169,7 @@ std::string describe(const PNode& p) {
       std::string s = "IndexScan " + p.table->name + "." + p.index->name;
       std::string k = keyCondition(p);
       s += k.empty() ? " (full, for order)" : " [" + k + "]";
+      if (p.reverse) s += " reverse";
       if (p.pred) s += " filter " + toString(*p.pred);
       return s;
     }
