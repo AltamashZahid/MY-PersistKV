@@ -818,7 +818,7 @@ class VecAggregateOp : public Operator {
     std::vector<Partial> parts(threads <= 1 ? 1 : morsels);
     if (threads <= 1) {
       Grouper g(*this, parts[0]);
-      Workspace ws;
+      Workspace& ws = threadWorkspace();
       for (size_t m = 0; m < morsels; m++) aggregatePiece(pieces[m], g, ws);
       g.finish();
     } else {
@@ -827,7 +827,7 @@ class VecAggregateOp : public Operator {
       std::mutex error_mu;
       auto work = [&] {
         try {
-          Workspace ws;  // per thread, reused from morsel to morsel
+          Workspace& ws = threadWorkspace();  // per thread, reused across morsels and queries
           for (size_t m; (m = next.fetch_add(1)) < morsels;) {
             Grouper g(*this, parts[m]);
             aggregatePiece(pieces[m], g, ws);
@@ -1054,6 +1054,13 @@ class VecAggregateOp : public Operator {
     std::vector<ColumnVector> cols;
     std::vector<uint32_t> sel;
   };
+
+  // Kept per thread for its lifetime (the pool's threads are long-lived), so
+  // buffers are allocated once, not on every query's first morsel.
+  static Workspace& threadWorkspace() {
+    static thread_local Workspace ws;
+    return ws;
+  }
 
   void aggregatePiece(const Piece& p, Grouper& g, Workspace& ws) const {
     if (p.block) aggregateBlock(*p.block, p.lo, p.hi, g, ws);

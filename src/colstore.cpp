@@ -80,15 +80,22 @@ void unpackBits(std::string_view& in, size_t n, int width, Emit emit) {
   if (in.size() < bytes) throw Error("corrupt column block");
   const uint8_t* p = reinterpret_cast<const uint8_t*>(in.data());
   if (width <= 56) {
-    // Each value lies within 8 bytes from its first byte: load them (padded
-    // at the end of the stream) and shift.
+    // Each value lies within the 8 bytes from its first byte: one unaligned
+    // 8-byte load and a shift per value. Only the last few values, whose 8
+    // bytes would run past the stream, take the careful path.
     uint64_t mask = (1ull << width) - 1;
-    size_t bit = 0;
-    for (size_t i = 0; i < n; i++, bit += static_cast<size_t>(width)) {
+    size_t w = static_cast<size_t>(width);
+    size_t fast = bytes >= 8 ? std::min(n, ((bytes - 8) * 8) / w + 1) : 0;  // values with 8 readable bytes
+    size_t bit = 0, i = 0;
+    for (; i < fast; i++, bit += w) {
+      uint64_t word;
+      std::memcpy(&word, p + (bit >> 3), 8);  // little-endian hosts (x86, ARM)
+      emit(i, (word >> (bit & 7)) & mask);
+    }
+    for (; i < n; i++, bit += w) {
       size_t byte = bit >> 3;
       uint64_t word = 0;
-      size_t take = std::min<size_t>(8, bytes - byte);
-      std::memcpy(&word, p + byte, take);  // little-endian hosts (x86, ARM)
+      std::memcpy(&word, p + byte, std::min<size_t>(8, bytes - byte));
       emit(i, (word >> (bit & 7)) & mask);
     }
   } else {
@@ -420,12 +427,14 @@ uint32_t decodeBlock(const TableSchema& t, std::string_view in, const std::vecto
     in.remove_prefix(len);
     if (needed && !(*needed)[c]) continue;
     ColumnVector& cv = cols[c];
-    cv.reserve(t.cols[c].type, n);
+    // Sized once; every slot is written below (reused buffers keep their
+    // capacity from block to block).
+    cv.type = t.cols[c].type;
     cv.dict = t.dict(static_cast<int>(c));
+    cv.nulls.assign(n, 0);
     if (col.empty()) throw Error("corrupt column block");
     bool has_nulls = col[0] != 0;
     col.remove_prefix(1);
-    std::fill(cv.nulls.begin(), cv.nulls.end(), 0);
     if (has_nulls) {
       size_t bytes = (n + 7) / 8;
       if (col.size() < bytes) throw Error("corrupt column block");
@@ -464,13 +473,20 @@ uint32_t decodeBlock(const TableSchema& t, std::string_view in, const std::vecto
         throw Error("corrupt column block: bad float encoding");
       }
     } else {
+      cv.codes.resize(n);
+      if (cv.texts.size() < n) cv.texts.resize(n);
       if (tag == kTextDict) {
         if (!cv.dict) throw Error("corrupt column block: coded text without a dictionary");
-        size_t limit = cv.dict->values.size();
-        getIntFor(col, n, [&](size_t i, int64_t code) {
-          if (!cv.nulls[i] && (code < 0 || static_cast<size_t>(code) >= limit)) throw Error("corrupt column block: code");
-          cv.codes[i] = cv.nulls[i] ? -1 : static_cast<int32_t>(code);
-        });
+        int64_t limit = static_cast<int64_t>(cv.dict->values.size());
+        int32_t* codes = cv.codes.data();
+        getIntFor(col, n, [&](size_t i, int64_t code) { codes[i] = static_cast<int32_t>(code); });
+        // Validate after the tight loop; nulls get no code.
+        bool bad = false;
+        for (size_t i = 0; i < n; i++) {
+          if (cv.nulls[i]) codes[i] = -1;
+          else bad |= codes[i] < 0 || codes[i] >= limit;
+        }
+        if (bad) throw Error("corrupt column block: code");
       } else if (tag == kTextPlain) {
         for (size_t i = 0; i < n; i++) {
           size_t l = static_cast<size_t>(getVarint(col));
