@@ -70,4 +70,6 @@ if(PKQL_BENCH)
 
   add_executable(bench_vs_sqlite bench/bench_vs_sqlite.cpp)
   target_link_libraries(bench_vs_sqlite PRIVATE pkql ${PKQL_SQLITE})
+  add_executable(bench_events bench/bench_events.cpp)
+  target_link_libraries(bench_events PRIVATE pkql ${PKQL_SQLITE})
 endif()
