@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cerrno>
 #include <cstdlib>
 
@@ -91,6 +92,23 @@ std::vector<Token> lex(std::string_view src) {
           while (j < src.size() && std::isdigit(static_cast<unsigned char>(src[j]))) j++;
         }
       }
+      // A duration (500ms, 30s, 5m, 1h, 7d, 2w) is an int in milliseconds.
+      static const std::pair<const char*, int64_t> kUnits[] = {
+          {"ms", 1}, {"s", 1000}, {"m", 60000}, {"h", 3600000}, {"d", 86400000}, {"w", 604800000}};
+      size_t u = j;
+      while (u < src.size() && std::isalpha(static_cast<unsigned char>(src[u]))) u++;
+      if (u > j && (u == src.size() || !(std::isalnum(static_cast<unsigned char>(src[u])) || src[u] == '_'))) {
+        std::string unit(src.substr(j, u - j));
+        for (const auto& un : kUnits) {
+          if (unit != un.first) continue;
+          double amount = std::strtod(std::string(src.substr(i, j - i)).c_str(), nullptr);
+          push(Tok::Int, std::to_string(static_cast<long long>(std::llround(amount * static_cast<double>(un.second)))), start_col);
+          col += static_cast<int>(u - i);
+          i = u;
+          break;
+        }
+        if (i == u) continue;
+      }
       push(is_float ? Tok::Float : Tok::Int, std::string(src.substr(i, j - i)), start_col);
       col += static_cast<int>(j - i);
       i = j;
@@ -148,7 +166,7 @@ std::vector<Token> lex(std::string_view src) {
 // Parser
 // ---------------------------------------------------------------------------
 
-const char* kAggregates[] = {"count", "sum", "avg", "min", "max", "count_distinct"};
+const char* kAggregates[] = {"count", "sum", "avg", "min", "max", "count_distinct", "median", "p90", "p95", "p99"};
 
 bool isAggregate(const std::string& s) {
   for (const char* a : kAggregates) {
@@ -435,8 +453,10 @@ class Parser {
         a.name = take().text;
         p_++;
       }
-      a.fn = ident("an aggregate (count, sum, avg, min, max, count_distinct)");
-      if (!isAggregate(a.fn)) fail("`" + a.fn + "` is not an aggregate (count, sum, avg, min, max, count_distinct)");
+      a.fn = ident("an aggregate (count, sum, avg, min, max, count_distinct, median, p90, p95, p99)");
+      if (!isAggregate(a.fn)) {
+        fail("`" + a.fn + "` is not an aggregate (count, sum, avg, min, max, count_distinct, median, p90, p95, p99)");
+      }
       expectSym("(");
       if (!isSym(")")) a.arg = expr();
       expectSym(")");

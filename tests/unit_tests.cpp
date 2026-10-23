@@ -9,6 +9,8 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
 
 #include "pkql/codec.h"
@@ -313,6 +315,52 @@ TEST(bulk_load_checks_keys_and_types) {
   CHECK(threw);
   CHECK(cell(db, "from t | aggregate { n = count() }") == "5000");
   CHECK(db.checkIntegrity().empty());
+}
+
+// --- Time and event analytics ------------------------------------------------------
+
+TEST(durations_and_time_functions) {
+  Engine db(freshDir("time_fns"), fast());
+  db.run("table t (id: int key, ts: int?)");
+  db.run("insert t {id: 1, ts: -1}, {id: 2, ts: 1700000000123}, {id: 3, ts: null}");
+  CHECK(cell(db, "from t | filter id == 1 | select d = 1h + 30m + 1.5s + 250ms + 2d + 1w") ==
+        std::to_string(3600000 + 1800000 + 1500 + 250 + 2 * 86400000LL + 604800000LL));
+  CHECK(cell(db, "from t | filter id == 1 | select b = bucket(ts, 1s)") == "-1000");  // rounds down, also below 0
+  CHECK(cell(db, "from t | filter id == 2 | select b = bucket(ts, 1d)") == "1699920000000");
+  CHECK(cell(db, "from t | filter id == 2 | select b = bucket(ts, 0)") == "null");
+  CHECK(cell(db, "from t | filter id == 3 | select b = bucket(ts, 1h)") == "null");
+  CHECK(cell(db, "from t | filter id == 2 | select s = time_text(ts)") == "2023-11-14 22:13:20.123");
+  CHECK(cell(db, "from t | filter id == 1 | select s = time_text(ts)") == "1969-12-31 23:59:59.999");
+  CHECK_ERROR(db, "from t | select x = ago(id)", "ago needs a constant duration");
+  CHECK_ERROR(db, "from t | select x = bucket(ts, \"1h\")", "bucket needs an int width");
+}
+
+TEST(percentile_aggregates) {
+  Engine db(freshDir("percentiles"), fast());
+  db.run("table t (id: int key, g: text, v: float?)");
+  db.run("insert t {id: 1, g: \"a\", v: 1}, {id: 2, g: \"a\", v: 2}, {id: 3, g: \"a\", v: 10}, {id: 4, g: \"a\", v: null},"
+         " {id: 5, g: \"b\", v: null}");
+  // Linear interpolation between neighbours, nulls skipped (like percentile_cont).
+  CHECK(cell(db, "from t | filter g == \"a\" | aggregate { m = median(v) }") == "2.0");
+  CHECK(cell(db, "from t | filter g == \"a\" | aggregate { p = p95(v) }") == "9.2");
+  CHECK(cell(db, "from t | filter g == \"a\" | aggregate { p = p99(v) }") == "9.84");
+  CHECK(cell(db, "from t | filter g == \"b\" | aggregate { p = p90(v) }") == "null");
+  CHECK(cell(db, "from t | filter g == \"zz\" | aggregate { p = median(v) }") == "null");
+  CHECK_ERROR(db, "from t | aggregate { p = median(g) }", "median() needs a number");
+}
+
+TEST(time_ranges_use_the_key_and_stay_fresh) {
+  Engine db(freshDir("time_range"), fast());
+  db.run("table ev (ts: int key, kind: text)");
+  db.run("insert ev {ts: now() - 2h, kind: \"old\"}, {ts: now() - 10m, kind: \"new\"}, {ts: now() + 400ms, kind: \"soon\"}");
+  // ago() becomes a primary-key range, so only recent rows are read.
+  CHECK(has(plan(db, "from ev | filter ts >= ago(1h) | aggregate { n = count() }"), "TableScan ev [ts >= ago(1h)]"));
+  CHECK(cell(db, "from ev | filter ts >= ago(1h) and ts <= now() | aggregate { n = count() }") == "1");
+  // The same query again runs from the plan cache, which must use the
+  // current time, not the time it was planned at.
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  CHECK(cell(db, "from ev | filter ts >= ago(1h) and ts <= now() | aggregate { n = count() }") == "2");
+  CHECK(db.planCacheHits() > 0);
 }
 
 // --- Optimizer -------------------------------------------------------------------

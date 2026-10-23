@@ -566,7 +566,7 @@ bool vectorizable(const PNode& p) {
       if (t != Type::Int && t != Type::Text) return false;
     }
     for (const AggSpec& a : p.aggs) {
-      if (a.fn == "count_distinct") return false;
+      if (a.fn != "count" && a.fn != "sum" && a.fn != "avg" && a.fn != "min" && a.fn != "max") return false;
       if (!a.arg) {
         if (a.fn != "count") return false;
         continue;

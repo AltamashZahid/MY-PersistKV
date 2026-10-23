@@ -297,12 +297,31 @@ Query generate(const std::vector<Tab>& tabs) {
       if (r.col->type != Type::Text) nums.push_back(r);
     }
     const Ref& m = nums[pick(static_cast<int>(nums.size()))];
-    q.pkql += " | group " + key.q() + " { n = count(), s = sum(" + m.q() + "), lo = min(" + m.q() + "), hi = max(" +
-              m.q() + ") }";
-    select_sql = key.q() + ", count(*), sum(" + m.q() + "), min(" + m.q() + "), max(" + m.q() + ")";
-    group_sql = " group by " + key.q();
-    out_pkql = {key.col->name, "n", "s", "lo", "hi"};
+    // The key is a column, or sometimes a time bucket of an int column:
+    // bucket(x, w) rounds down to a multiple of w, which SQL spells
+    // x - ((x % w) + w) % w.
+    std::string key_pkql = key.q(), key_sql = key.q(), key_name = key.col->name;
+    if (key.col->type == Type::Int && pick(3) == 0) {
+      std::string w = std::to_string(2 + pick(9));
+      key_name = "b";
+      key_pkql = "b = bucket(" + key.q() + ", " + w + ")";
+      key_sql = "(" + key.q() + " - ((" + key.q() + " % " + w + ") + " + w + ") % " + w + ")";
+    }
+    q.pkql += " | group " + key_pkql + " { n = count(), s = sum(" + m.q() + "), lo = min(" + m.q() + "), hi = max(" +
+              m.q() + ")";
+    select_sql = key_sql + ", count(*), sum(" + m.q() + "), min(" + m.q() + "), max(" + m.q() + ")";
+    out_pkql = {key_name, "n", "s", "lo", "hi"};
     out_sql = {"1", "2", "3", "4", "5"};
+    if (pick(3) == 0) {  // percentiles, checked against SQLite's median / percentile_cont
+      q.pkql += ", md = median(" + m.q() + "), q9 = p90(" + m.q() + ")";
+      select_sql += ", median(" + m.q() + "), percentile_cont(" + m.q() + ", 0.9)";
+      out_pkql.push_back("md");
+      out_pkql.push_back("q9");
+      out_sql.push_back("6");
+      out_sql.push_back("7");
+    }
+    q.pkql += " }";
+    group_sql = " group by " + key_sql;
   } else {
     // Projected.
     int k = 1 + pick(3);

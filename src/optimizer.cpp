@@ -199,8 +199,20 @@ struct Bound {  // column op literal, normalized so the column is on the left
   int col = -1;
   Op op = Op::Eq;
   Value value;
-  int param = -1;  // plan-cache parameter slot of the literal
+  int param = -1;               // plan-cache parameter slot of the literal
+  const Expr* lit = nullptr;    // the literal itself
 };
+
+// A key-bound literal for b's value, still refreshed per run if it was now().
+ExprPtr boundLiteral(const Bound& b) {
+  ExprPtr e = Expr::literal(b.value);
+  e->param = b.param;
+  if (b.lit && b.lit->now) {
+    e->now = true;
+    e->now_offset = b.lit->now_offset;
+  }
+  return e;
+}
 
 Op flip(Op op) {
   switch (op) {
@@ -221,11 +233,11 @@ bool asBound(const Expr& e, Bound* b) {
   const Expr& l = *e.args[0];
   const Expr& r = *e.args[1];
   if (l.kind == ExprKind::Column && r.kind == ExprKind::Literal) {
-    *b = {l.index, e.op, r.value, r.param};
+    *b = {l.index, e.op, r.value, r.param, &r};
     return true;
   }
   if (r.kind == ExprKind::Column && l.kind == ExprKind::Literal) {
-    *b = {r.index, flip(e.op), l.value, l.param};
+    *b = {r.index, flip(e.op), l.value, l.param, &l};
     return true;
   }
   return false;
@@ -417,8 +429,7 @@ KeyMatch matchKey(const std::vector<int>& key_cols, const TableSchema& t, const 
       Bound b;
       if (m.used[i] || !asBound(*conjs[i], &b) || b.col != kc || b.op != Op::Eq) continue;
       if (!keyLiteral(type, &b.value)) continue;
-      m.eq.push_back(Expr::literal(b.value));
-      m.eq.back()->param = b.param;
+      m.eq.push_back(boundLiteral(b));
       m.used[i] = true;
       found_eq = true;
     }
@@ -435,11 +446,11 @@ KeyMatch matchKey(const std::vector<int>& key_cols, const TableSchema& t, const 
       if (asBound(c, &b) && b.col == kc && b.op != Op::Eq && b.op != Op::Ne && !b.value.isNull() &&
           keyLiteral(type, &b.value)) {
         if ((b.op == Op::Gt || b.op == Op::Ge) && !m.lo) {
-          m.lo = Expr::literal(b.value);
+          m.lo = boundLiteral(b);
           m.lo_incl = b.op == Op::Ge;
           m.used[i] = true;
         } else if ((b.op == Op::Lt || b.op == Op::Le) && !m.hi) {
-          m.hi = Expr::literal(b.value);
+          m.hi = boundLiteral(b);
           m.hi_incl = b.op == Op::Le;
           m.used[i] = true;
         }

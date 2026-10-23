@@ -2,10 +2,24 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 
 namespace pkql {
+
+int64_t nowMillis() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+ExprPtr Expr::nowLiteral(int64_t offset_ms) {
+  ExprPtr e = literal(Value::integer(nowMillis() + offset_ms));
+  e->now = true;
+  e->now_offset = offset_ms;
+  return e;
+}
 
 ExprPtr Expr::literal(Value v) {
   auto e = std::make_shared<Expr>();
@@ -60,7 +74,8 @@ std::string displayName(const ColumnInfo& c) {
 namespace {
 
 bool isAggregateName(const std::string& n) {
-  return n == "count" || n == "sum" || n == "avg" || n == "min" || n == "max" || n == "count_distinct";
+  return n == "count" || n == "sum" || n == "avg" || n == "min" || n == "max" || n == "count_distinct" ||
+         n == "median" || n == "p90" || n == "p95" || n == "p99";
 }
 
 bool numeric(Type t) { return t == Type::Int || t == Type::Float; }
@@ -262,6 +277,32 @@ ExprPtr bindExpr(const ExprPtr& src, const Schema& schema) {
         if (!numeric(e->args[0]->type)) typeError(*e, "round needs a number");
         e->type = Type::Int;
         e->nullable = e->args[0]->nullable;
+      } else if (fn == "now" || fn == "ago") {
+        // Timestamps are ints: milliseconds since 1970 (UTC). now() and
+        // ago(d) = now() - d become literals that cached plans refresh on
+        // every run, so `filter ts >= ago(1h)` can still use a key range.
+        if (fn == "now") {
+          argc(0);
+          return Expr::nowLiteral(0);
+        }
+        argc(1);
+        ExprPtr d = foldConstants(e->args[0]);
+        if (d->kind != ExprKind::Literal || d->now || d->value.type() != Type::Int) {
+          typeError(*e, "ago needs a constant duration, like ago(1h)");
+        }
+        return Expr::nowLiteral(-d->value.asInt());
+      } else if (fn == "bucket") {
+        // bucket(ts, 1h): ts rounded down to a multiple of the width.
+        argc(2);
+        if (e->args[0]->type != Type::Int && e->args[0]->type != Type::Null) typeError(*e, "bucket needs an int timestamp");
+        if (e->args[1]->type != Type::Int) typeError(*e, "bucket needs an int width, like 1h");
+        e->type = Type::Int;
+        e->nullable = true;  // null for a width <= 0
+      } else if (fn == "time_text") {
+        argc(1);
+        if (e->args[0]->type != Type::Int && e->args[0]->type != Type::Null) typeError(*e, "time_text needs an int timestamp");
+        e->type = Type::Text;
+        e->nullable = e->args[0]->nullable;
       } else {
         throw Error("unknown function " + fn + "()");
       }
@@ -276,6 +317,35 @@ ExprPtr bindExpr(const ExprPtr& src, const Schema& schema) {
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// x rounded down to a multiple of w (w > 0), also for negative x.
+int64_t floorTo(int64_t x, int64_t w) {
+  int64_t q = x / w;
+  if (x % w != 0 && x < 0) q--;
+  return q * w;
+}
+
+// "YYYY-MM-DD HH:MM:SS.mmm" (UTC) for milliseconds since 1970.
+std::string timeText(int64_t ms) {
+  int64_t days = floorTo(ms, 86400000) / 86400000;
+  int64_t rem = ms - days * 86400000;
+  // Civil date from a day count (H. Hinnant's algorithm).
+  int64_t z = days + 719468;
+  int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+  int64_t doe = z - era * 146097;
+  int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int64_t mp = (5 * doy + 2) / 153;
+  int64_t d = doy - (153 * mp + 2) / 5 + 1;
+  int64_t m = mp < 10 ? mp + 3 : mp - 9;
+  int64_t y = yoe + era * 400 + (m <= 2 ? 1 : 0);
+  char buf[48];
+  std::snprintf(buf, sizeof buf, "%04lld-%02lld-%02lld %02lld:%02lld:%02lld.%03lld", static_cast<long long>(y),
+                static_cast<long long>(m), static_cast<long long>(d), static_cast<long long>(rem / 3600000),
+                static_cast<long long>(rem / 60000 % 60), static_cast<long long>(rem / 1000 % 60),
+                static_cast<long long>(rem % 1000));
+  return buf;
+}
 
 Value arith(Op op, const Value& a, const Value& b) {
   if (a.isNull() || b.isNull()) return Value::null();
@@ -387,6 +457,12 @@ Value eval(const Expr& e, const Row& row) {
       if (fn == "length") return Value::integer(static_cast<int64_t>(a.asText().size()));
       if (fn == "abs") return a.type() == Type::Int ? Value::integer(std::llabs(a.asInt())) : Value::real(std::fabs(a.asFloat()));
       if (fn == "round") return Value::integer(static_cast<int64_t>(std::llround(a.asNumber())));
+      if (fn == "bucket") {
+        const Value& w = evalRef(*e.args[1], row, t1);
+        if (w.isNull() || w.asInt() <= 0) return Value::null();
+        return Value::integer(floorTo(a.asInt(), w.asInt()));
+      }
+      if (fn == "time_text") return Value::text(timeText(a.asInt()));
       throw Error("unknown function " + fn);
     }
   }
@@ -399,7 +475,25 @@ Value eval(const Expr& e, const Row& row) {
 
 std::string toString(const Expr& e) {
   switch (e.kind) {
-    case ExprKind::Literal: return e.value.literal();
+    case ExprKind::Literal:
+      if (e.now) {
+        if (e.now_offset == 0) return "now()";
+        // The largest unit that divides the offset: ago(1h), not ago(3600000ms).
+        int64_t d = e.now_offset < 0 ? -e.now_offset : e.now_offset;
+        const char* unit = "ms";
+        int64_t n = d;
+        for (auto u : {std::make_pair("w", 604800000LL), std::make_pair("d", 86400000LL), std::make_pair("h", 3600000LL),
+                       std::make_pair("m", 60000LL), std::make_pair("s", 1000LL)}) {
+          if (d % u.second == 0) {
+            unit = u.first;
+            n = d / u.second;
+            break;
+          }
+        }
+        std::string dur = std::to_string(n) + unit;
+        return e.now_offset < 0 ? "ago(" + dur + ")" : "now() + " + dur;
+      }
+      return e.value.literal();
     case ExprKind::Column: return e.qualifier.empty() ? e.name : e.qualifier + "." + e.name;
     case ExprKind::Unary:
       return e.op == Op::Not ? "not " + toString(*e.args[0]) : "-" + toString(*e.args[0]);
@@ -481,7 +575,7 @@ ExprPtr substituteColumns(const ExprPtr& e, const std::vector<ExprPtr>& replacem
 }
 
 bool isConstant(const Expr& e) {
-  if (e.kind == ExprKind::Column) return false;
+  if (e.kind == ExprKind::Column || e.now) return false;
   return std::all_of(e.args.begin(), e.args.end(), [](const ExprPtr& a) { return isConstant(*a); });
 }
 
@@ -495,6 +589,14 @@ ExprPtr foldConstants(const ExprPtr& e) {
   }
   auto out = std::make_shared<Expr>(*e);
   for (ExprPtr& a : out->args) a = foldConstants(a);
+  // now() + c and now() - c fold into a now-literal with an offset.
+  if (out->kind == ExprKind::Binary && (out->op == Op::Add || out->op == Op::Sub)) {
+    const Expr& l = *out->args[0];
+    const Expr& r = *out->args[1];
+    auto plainInt = [](const Expr& x) { return x.kind == ExprKind::Literal && !x.now && x.value.type() == Type::Int; };
+    if (l.now && plainInt(r)) return Expr::nowLiteral(l.now_offset + (out->op == Op::Add ? r.value.asInt() : -r.value.asInt()));
+    if (r.now && plainInt(l) && out->op == Op::Add) return Expr::nowLiteral(r.now_offset + l.value.asInt());
+  }
   return out;
 }
 

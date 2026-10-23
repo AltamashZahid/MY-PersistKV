@@ -34,8 +34,13 @@ struct Expr {
   bool nullable = true;       // can evaluate to null (bound)
   int param = -1;             // Literal: plan-cache parameter slot (-1 = baked into the plan)
   int token = -1;             // Literal: index of its token in the source, for fingerprints
+  // Literal: the current time plus now_offset milliseconds (now(), ago(1h)).
+  // Its value is refreshed on every execution of a cached plan.
+  bool now = false;
+  int64_t now_offset = 0;
 
   static ExprPtr literal(Value v);
+  static ExprPtr nowLiteral(int64_t offset_ms);
   static ExprPtr column(std::string qualifier, std::string name);
   static ExprPtr unary(Op op, ExprPtr a);
   static ExprPtr binary(Op op, ExprPtr a, ExprPtr b);
@@ -76,5 +81,6 @@ ExprPtr remapColumns(const ExprPtr& e, const std::vector<int>& mapping);  // ind
 ExprPtr substituteColumns(const ExprPtr& e, const std::vector<ExprPtr>& replacement);
 ExprPtr foldConstants(const ExprPtr& e);
 bool isConstant(const Expr& e);
+int64_t nowMillis();  // milliseconds since 1970-01-01 UTC
 
 }  // namespace pkql

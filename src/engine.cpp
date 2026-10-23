@@ -100,28 +100,29 @@ void collectTables(const PNode& p, std::vector<const TableSchema*>& out) {
   for (const PPtr& k : p.kids) collectTables(*k, out);
 }
 
-void patchExpr(const ExprPtr& e, const std::vector<Value>& params) {
+void patchExpr(const ExprPtr& e, const std::vector<Value>& params, int64_t now) {
   if (!e) return;
+  if (e->kind == ExprKind::Literal && e->now) e->value = Value::integer(now + e->now_offset);
   if (e->kind == ExprKind::Literal && e->param >= 0 && e->param < static_cast<int>(params.size())) {
     Value v = params[e->param];
     if (e->value.type() == Type::Float && v.type() == Type::Int) v = v.castTo(Type::Float);
     e->value = std::move(v);
   }
-  for (const ExprPtr& a : e->args) patchExpr(a, params);
+  for (const ExprPtr& a : e->args) patchExpr(a, params, now);
 }
 
 // Puts this execution's literal values into a cached plan.
-void patchPlan(PNode& p, const std::vector<Value>& params) {
-  for (const ExprPtr& e : p.eq) patchExpr(e, params);
-  patchExpr(p.lo, params);
-  patchExpr(p.hi, params);
-  patchExpr(p.pred, params);
-  for (const ExprPtr& e : p.left_keys) patchExpr(e, params);
-  for (const ExprPtr& e : p.right_keys) patchExpr(e, params);
-  for (const ExprPtr& e : p.exprs) patchExpr(e, params);
-  for (const AggSpec& a : p.aggs) patchExpr(a.arg, params);
-  for (const SortSpec& s : p.sort) patchExpr(s.expr, params);
-  for (const PPtr& k : p.kids) patchPlan(*k, params);
+void patchPlan(PNode& p, const std::vector<Value>& params, int64_t now) {
+  for (const ExprPtr& e : p.eq) patchExpr(e, params, now);
+  patchExpr(p.lo, params, now);
+  patchExpr(p.hi, params, now);
+  patchExpr(p.pred, params, now);
+  for (const ExprPtr& e : p.left_keys) patchExpr(e, params, now);
+  for (const ExprPtr& e : p.right_keys) patchExpr(e, params, now);
+  for (const ExprPtr& e : p.exprs) patchExpr(e, params, now);
+  for (const AggSpec& a : p.aggs) patchExpr(a.arg, params, now);
+  for (const SortSpec& s : p.sort) patchExpr(s.expr, params, now);
+  for (const PPtr& k : p.kids) patchPlan(*k, params, now);
 }
 
 }  // namespace
@@ -167,7 +168,7 @@ bool Engine::runFast(std::string_view text, Result* out) {
 }
 
 Result Engine::runCached(CachedPlan& c, const std::vector<Value>& params) {
-  patchPlan(*c.plan, params);
+  patchPlan(*c.plan, params, nowMillis());
   auto t0 = std::chrono::steady_clock::now();
   Result r;
   if (!c.op) c.op = buildOperator(*c.plan, exec_ctx_);

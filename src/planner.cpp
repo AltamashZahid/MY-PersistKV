@@ -149,8 +149,8 @@ class LogicalPlanner {
           if (a.fn == "count" || a.fn == "count_distinct") {
             c.type = Type::Int;
             c.nullable = false;
-          } else if (a.fn == "avg") {
-            if (t != Type::Int && t != Type::Float) throw Error("avg() needs a number");
+          } else if (a.fn == "avg" || a.fn == "median" || a.fn == "p90" || a.fn == "p95" || a.fn == "p99") {
+            if (t != Type::Int && t != Type::Float) throw Error(a.fn + "() needs a number");
             c.type = Type::Float;
           } else if (a.fn == "sum") {
             if (t != Type::Int && t != Type::Float) throw Error("sum() needs a number");

@@ -448,7 +448,7 @@ class NestedLoopJoinOp : public Operator {
   bool have_left_ = false, matched_ = false;
 };
 
-enum class AggFn { Count, CountArg, Sum, Avg, Min, Max, CountDistinct };
+enum class AggFn { Count, CountArg, Sum, Avg, Min, Max, CountDistinct, Quantile };
 
 AggFn aggKind(const AggSpec& a) {
   if (a.fn == "count") return a.arg ? AggFn::CountArg : AggFn::Count;
@@ -456,7 +456,29 @@ AggFn aggKind(const AggSpec& a) {
   if (a.fn == "avg") return AggFn::Avg;
   if (a.fn == "min") return AggFn::Min;
   if (a.fn == "max") return AggFn::Max;
-  return AggFn::CountDistinct;
+  if (a.fn == "count_distinct") return AggFn::CountDistinct;
+  return AggFn::Quantile;
+}
+
+// The fraction a percentile aggregate asks for.
+double quantileOf(const std::string& fn) {
+  if (fn == "p90") return 0.90;
+  if (fn == "p95") return 0.95;
+  if (fn == "p99") return 0.99;
+  return 0.5;  // median
+}
+
+// Exact percentile with linear interpolation between neighbours (like
+// percentile_cont in PostgreSQL and SQLite).
+Value quantile(std::vector<double> v, double q) {
+  if (v.empty()) return Value::null();
+  double pos = q * static_cast<double>(v.size() - 1);
+  size_t lo = static_cast<size_t>(pos);
+  std::nth_element(v.begin(), v.begin() + static_cast<long>(lo), v.end());
+  double a = v[lo];
+  if (lo + 1 >= v.size()) return Value::real(a);
+  double b = *std::min_element(v.begin() + static_cast<long>(lo) + 1, v.end());
+  return Value::real(a + (b - a) * (pos - static_cast<double>(lo)));
 }
 
 struct AggState {
@@ -467,6 +489,7 @@ struct AggState {
   Value min, max;
   bool seen = false;  // any non-null input
   std::unordered_set<Row, RowHash, RowEq> distinct;
+  std::vector<double> values;  // percentiles
 };
 
 class HashAggregateOp : public Operator {
@@ -544,6 +567,9 @@ class HashAggregateOp : public Operator {
       case AggFn::CountDistinct:
         s.distinct.insert(Row{v});
         break;
+      case AggFn::Quantile:
+        s.values.push_back(v.asNumber());
+        break;
       default:
         break;
     }
@@ -556,7 +582,8 @@ class HashAggregateOp : public Operator {
     if (a.fn == "sum") return s.is_float || a.arg->type == Type::Float ? Value::real(s.fsum) : Value::integer(s.isum);
     if (a.fn == "avg") return Value::real(s.fsum / static_cast<double>(s.count));
     if (a.fn == "min") return s.min;
-    return s.max;
+    if (a.fn == "max") return s.max;
+    return quantile(s.values, quantileOf(a.fn));
   }
 
   std::unique_ptr<Operator> child_;
