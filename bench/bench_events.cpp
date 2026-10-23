@@ -38,10 +38,14 @@ int main(int argc, char** argv) {
   double scale = argc > 1 ? std::atof(argv[1]) : 1.0;
   std::string dir = argc > 2 ? argv[2] : "bench_data";
   pkv::makeDir(dir);
-  std::string pk_dir = dir + "/pkql_events";
+  // A DuckDB-only run leaves the PKQL and SQLite files of the last run alone.
+  const char* engines_env = std::getenv("PKQL_BENCH_ENGINES");
+  bool main_engines = !engines_env || std::string(engines_env).find("pkql") != std::string::npos;
+  std::string suffix = main_engines ? "" : "_idle";
+  std::string pk_dir = dir + "/pkql_events" + suffix;
   pkv::makeDir(pk_dir);
   pkv::DB::destroy(pk_dir);
-  std::string sq_path = dir + "/sqlite_events.db";
+  std::string sq_path = dir + "/sqlite_events" + suffix + ".db";
   std::remove(sq_path.c_str());
   std::remove((sq_path + "-wal").c_str());
   std::remove((sq_path + "-shm").c_str());

@@ -447,9 +447,16 @@ uint32_t decodeBlock(const TableSchema& t, std::string_view in, const std::vecto
         uint8_t itag = static_cast<uint8_t>(col[1]);
         col.remove_prefix(2);
         if (e > 6) throw Error("corrupt column block");
-        std::vector<int64_t> v(n);
-        decodeInts(col, itag, n, v.data());
-        for (size_t i = 0; i < n; i++) cv.floats[i] = static_cast<double>(v[i]) / kPow10[e];
+        // Decode the integers in place in the float array's storage, then
+        // convert each (int64 and double are both 8 bytes).
+        int64_t* tmp = reinterpret_cast<int64_t*>(cv.floats.data());
+        decodeInts(col, itag, n, tmp);
+        double scale = kPow10[e];
+        for (size_t i = 0; i < n; i++) {
+          int64_t x;
+          std::memcpy(&x, &tmp[i], 8);
+          cv.floats[i] = static_cast<double>(x) / scale;
+        }
       } else if (tag == kFloatRaw) {
         if (col.size() < 8 * n) throw Error("corrupt column block");
         std::memcpy(cv.floats.data(), col.data(), 8 * n);

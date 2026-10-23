@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <functional>
 #include <cstdlib>
 #include <chrono>
 #include <exception>
@@ -608,6 +610,72 @@ struct KeyEq {
 };
 constexpr size_t kMaxThreads = 16;
 
+// Worker threads kept for parallel scans: started once, then woken per
+// parallel phase. Creating and joining 16 threads per query cost ~1.5 ms on
+// Windows, more than a whole small scan.
+class WorkerPool {
+ public:
+  static WorkerPool& instance() {
+    static WorkerPool pool;
+    return pool;
+  }
+
+  // Runs fn on n threads (the caller is one of them) and waits for all.
+  void run(size_t n, const std::function<void()>& fn) {
+    std::lock_guard<std::mutex> one_job(run_mu_);
+    size_t helpers = n > 0 ? n - 1 : 0;
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      while (workers_.size() < helpers) workers_.emplace_back([this] { loop(); });
+      job_ = &fn;
+      wanted_ = helpers;
+      claimed_ = 0;
+      running_ = helpers;
+      generation_++;
+    }
+    work_cv_.notify_all();
+    fn();
+    std::unique_lock<std::mutex> lock(mu_);
+    done_cv_.wait(lock, [&] { return running_ == 0; });
+    job_ = nullptr;
+  }
+
+  ~WorkerPool() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+    }
+    work_cv_.notify_all();
+    for (std::thread& t : workers_) t.join();
+  }
+
+ private:
+  void loop() {
+    uint64_t seen = 0;
+    std::unique_lock<std::mutex> lock(mu_);
+    while (true) {
+      work_cv_.wait(lock, [&] { return stopping_ || (generation_ != seen && claimed_ < wanted_); });
+      if (stopping_) return;
+      seen = generation_;
+      claimed_++;
+      const std::function<void()>* job = job_;
+      lock.unlock();
+      (*job)();
+      lock.lock();
+      if (--running_ == 0) done_cv_.notify_all();
+    }
+  }
+
+  std::mutex run_mu_;  // one parallel phase at a time
+  std::mutex mu_;
+  std::condition_variable work_cv_, done_cv_;
+  std::vector<std::thread> workers_;
+  const std::function<void()>* job_ = nullptr;
+  size_t wanted_ = 0, claimed_ = 0, running_ = 0;
+  uint64_t generation_ = 0;
+  bool stopping_ = false;
+};
+
 // Threads for parallel scans: the hardware's, at most kMaxThreads, or the
 // PKQL_THREADS environment variable (1 turns parallelism off).
 size_t workerThreads() {
@@ -750,7 +818,8 @@ class VecAggregateOp : public Operator {
     std::vector<Partial> parts(threads <= 1 ? 1 : morsels);
     if (threads <= 1) {
       Grouper g(*this, parts[0]);
-      for (size_t m = 0; m < morsels; m++) aggregatePiece(pieces[m], g);
+      Workspace ws;
+      for (size_t m = 0; m < morsels; m++) aggregatePiece(pieces[m], g, ws);
       g.finish();
     } else {
       std::atomic<size_t> next{0};
@@ -758,9 +827,10 @@ class VecAggregateOp : public Operator {
       std::mutex error_mu;
       auto work = [&] {
         try {
+          Workspace ws;  // per thread, reused from morsel to morsel
           for (size_t m; (m = next.fetch_add(1)) < morsels;) {
             Grouper g(*this, parts[m]);
-            aggregatePiece(pieces[m], g);
+            aggregatePiece(pieces[m], g, ws);
             g.finish();
           }
         } catch (...) {
@@ -769,10 +839,7 @@ class VecAggregateOp : public Operator {
           next = morsels;  // the others stop early
         }
       };
-      std::vector<std::thread> pool;
-      for (size_t t = 1; t < threads; t++) pool.emplace_back(work);
-      work();
-      for (std::thread& t : pool) t.join();
+      WorkerPool::instance().run(threads, work);
       if (error) std::rethrow_exception(error);
     }
 
@@ -814,10 +881,10 @@ class VecAggregateOp : public Operator {
           }
         }
       };
-      std::vector<std::thread> pool;
-      for (size_t p = 1; p < partitions; p++) pool.emplace_back(mergePartition, p);
-      mergePartition(0);
-      for (std::thread& t : pool) t.join();
+      std::atomic<size_t> next_partition{0};
+      WorkerPool::instance().run(partitions, [&] {
+        for (size_t p; (p = next_partition.fetch_add(1)) < partitions;) mergePartition(p);
+      });
       std::vector<Merged> all;
       for (auto& part : merged) {
         for (Merged& mg : part) all.push_back(std::move(mg));
@@ -878,17 +945,66 @@ class VecAggregateOp : public Operator {
       return static_cast<uint32_t>(out.groups.size() - 1);
     }
 
+    std::vector<uint32_t> gids;  // per selected row: its group
+
+    // Rows counted without being looked at (a column block's row count).
+    void addCount(uint64_t rows) {
+      out.passed += rows;
+      for (VState& st : out.groups[0]) st.count += static_cast<int64_t>(rows);
+    }
+
+    // Updates aggregate a of the rows' groups, one tight loop per kind of
+    // aggregate (vectorized aggregation) instead of a switch per row.
+    void update(size_t a, const std::vector<ColumnVector>& cols, const uint32_t* sel, size_t m) {
+      const VAgg& agg = op.aggs_[a];
+      std::vector<std::vector<VState>>& groups = out.groups;
+      auto state = [&](size_t j) -> VState& { return groups[key_col < 0 ? 0 : gids[j]][a]; };
+      if (agg.fn == VFn::Count) {
+        for (size_t j = 0; j < m; j++) state(j).count++;
+        return;
+      }
+      const ColumnVector& c = cols[agg.col];
+      if ((agg.fn == VFn::Sum || agg.fn == VFn::Avg) && c.type == Type::Float) {
+        for (size_t j = 0; j < m; j++) {
+          uint32_t i = sel[j];
+          if (c.nulls[i]) continue;
+          VState& st = state(j);
+          st.count++;
+          st.seen = true;
+          st.fsum += c.floats[i];
+        }
+        return;
+      }
+      if ((agg.fn == VFn::Sum || agg.fn == VFn::Avg) && c.type == Type::Int) {
+        for (size_t j = 0; j < m; j++) {
+          uint32_t i = sel[j];
+          if (c.nulls[i]) continue;
+          VState& st = state(j);
+          st.count++;
+          st.seen = true;
+          st.isum += c.ints[i];
+          st.fsum += static_cast<double>(c.ints[i]);
+        }
+        return;
+      }
+      if (agg.fn == VFn::CountCol) {
+        for (size_t j = 0; j < m; j++) {
+          if (!c.nulls[sel[j]]) state(j).count++;
+        }
+        return;
+      }
+      for (size_t j = 0; j < m; j++) updateState(agg, state(j), cols, sel[j]);
+    }
+
     void add(const std::vector<ColumnVector>& cols, const uint32_t* sel, size_t m) {
       out.passed += m;
       const std::vector<VAgg>& aggs = op.aggs_;
       if (key_col < 0) {
-        std::vector<VState>& st = out.groups[0];
-        for (size_t a = 0; a < aggs.size(); a++) {
-          for (size_t j = 0; j < m; j++) updateState(aggs[a], st[a], cols, sel[j]);
-        }
+        for (size_t a = 0; a < aggs.size(); a++) update(a, cols, sel, m);
         return;
       }
       const ColumnVector& kc = cols[key_col];
+      gids.resize(m);
       for (size_t j = 0; j < m; j++) {
         uint32_t i = sel[j];
         uint32_t g;
@@ -916,8 +1032,9 @@ class VecAggregateOp : public Operator {
         } else {
           g = int_groups.findOrAdd(kc.ints[i], [&] { return newGroup(kc.get(i)); });
         }
-        for (size_t a = 0; a < aggs.size(); a++) updateState(aggs[a], out.groups[g][a], cols, i);
+        gids[j] = g;
       }
+      for (size_t a = 0; a < aggs.size(); a++) update(a, cols, sel, m);
     }
 
     void finish() {
@@ -930,8 +1047,16 @@ class VecAggregateOp : public Operator {
     }
   };
 
-  void aggregatePiece(const Piece& p, Grouper& g) const {
-    if (p.block) aggregateBlock(*p.block, p.lo, p.hi, g);
+  // Buffers a worker reuses across morsels: decoding a block into fresh
+  // 128 KB arrays each time made threads queue on the heap's lock.
+  struct Workspace {
+    std::string blob;
+    std::vector<ColumnVector> cols;
+    std::vector<uint32_t> sel;
+  };
+
+  void aggregatePiece(const Piece& p, Grouper& g, Workspace& ws) const {
+    if (p.block) aggregateBlock(*p.block, p.lo, p.hi, g, ws);
     else aggregateRange(p.lo, p.hi, g);
   }
 
@@ -950,19 +1075,25 @@ class VecAggregateOp : public Operator {
 
   // Groups a column block's rows that lie in [lo, hi): the needed columns
   // are decoded straight from the compressed block.
-  void aggregateBlock(const BlockMeta& meta, const std::string& lo, const std::string& hi, Grouper& g) const {
+  void aggregateBlock(const BlockMeta& meta, const std::string& lo, const std::string& hi, Grouper& g,
+                      Workspace& ws) const {
     PNode& scan = *node_.kids[0];
     const TableSchema& t = *scan.table;
     BatchFilter filter(scan.pred, t.cols.size());
     if (!filter.mayMatch(meta, t)) return;  // its statistics rule out every row
-    std::string blob;
+    bool partial_range = meta.first_key < lo || (!hi.empty() && meta.last_key >= hi);
+    if (!scan.pred && !partial_range && countOnly()) {  // the block's row count answers it
+      g.addCount(meta.rows);
+      return;
+    }
+    std::string& blob = ws.blob;
     if (!ctx_.db.get(blockKey(t, meta.first_key), &blob)) throw Error("missing column block in table " + t.name);
     // A block sticking out of the scan range is cut by its (sorted) keys.
     bool partial = meta.first_key < lo || (!hi.empty() && meta.last_key >= hi);
     int pk = t.pk[0];
     std::vector<bool> need = scan.needed.empty() ? std::vector<bool>(t.cols.size(), true) : scan.needed;
     if (partial) need[pk] = true;
-    std::vector<ColumnVector> cols;
+    std::vector<ColumnVector>& cols = ws.cols;
     uint32_t n = decodeBlock(t, blob, &need, cols);
     size_t b = 0, e = n;
     if (partial) {
@@ -984,7 +1115,7 @@ class VecAggregateOp : public Operator {
       b = firstAtLeast(lo);
       if (!hi.empty()) e = firstAtLeast(hi);
     }
-    std::vector<uint32_t> sel;
+    std::vector<uint32_t>& sel = ws.sel;
     size_t m = filter.apply(cols, n, sel);
     if (partial) {
       size_t k = 0;
@@ -1006,6 +1137,15 @@ class VecAggregateOp : public Operator {
   }
 
  private:
+  // `aggregate { n = count(), ... }` with only count() of rows.
+  bool countOnly() const {
+    if (!node_.exprs.empty()) return false;
+    for (const VAgg& a : aggs_) {
+      if (a.fn != VFn::Count) return false;
+    }
+    return true;
+  }
+
   // Distinct group keys the statistics expect (1 for `aggregate`).
   double groupEstimate(const PNode& scan) const {
     if (node_.exprs.empty()) return 1;
