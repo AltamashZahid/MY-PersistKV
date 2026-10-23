@@ -10,6 +10,7 @@
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
+#include <memory>
 
 #include "pkql/codec.h"
 #include "pkql/colstore.h"
@@ -399,6 +400,102 @@ struct VAgg {
   double q = 0.5;  // Quantile
 };
 
+// Open addressing with linear probing, for int64 keys: one flat array, no
+// node per entry (std::unordered_set / map allocate one and chase a pointer
+// per lookup). Load factor at most 1/2.
+uint64_t mix64(uint64_t x) {
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdull;
+  x ^= x >> 33;
+  return x;
+}
+
+class IntSet {
+ public:
+  bool insert(int64_t k) {  // true if new
+    if ((size_ + 1) * 2 > slots_.size()) grow();
+    size_t mask = slots_.size() - 1;
+    for (size_t i = mix64(static_cast<uint64_t>(k)) & mask;; i = (i + 1) & mask) {
+      if (!used_[i]) {
+        used_[i] = 1;
+        slots_[i] = k;
+        size_++;
+        return true;
+      }
+      if (slots_[i] == k) return false;
+    }
+  }
+  size_t size() const { return size_; }
+  template <typename Fn>
+  void forEach(Fn fn) const {
+    for (size_t i = 0; i < slots_.size(); i++) {
+      if (used_[i]) fn(slots_[i]);
+    }
+  }
+
+ private:
+  void grow() {
+    std::vector<int64_t> old = std::move(slots_);
+    std::vector<uint8_t> old_used = std::move(used_);
+    slots_.assign(std::max<size_t>(16, old.size() * 2), 0);
+    used_.assign(slots_.size(), 0);
+    size_ = 0;
+    for (size_t i = 0; i < old.size(); i++) {
+      if (old_used[i]) insert(old[i]);
+    }
+  }
+  std::vector<int64_t> slots_;
+  std::vector<uint8_t> used_;
+  size_t size_ = 0;
+};
+
+// int64 key -> group number.
+class IntMap {
+ public:
+  // The group for k, calling make() for a new one.
+  template <typename Make>
+  uint32_t findOrAdd(int64_t k, Make make) {
+    if ((size_ + 1) * 2 > keys_.size()) grow();
+    size_t mask = keys_.size() - 1;
+    for (size_t i = mix64(static_cast<uint64_t>(k)) & mask;; i = (i + 1) & mask) {
+      if (vals_[i] == kEmpty) {
+        keys_[i] = k;
+        vals_[i] = make();
+        size_++;
+        return vals_[i];
+      }
+      if (keys_[i] == k) return vals_[i];
+    }
+  }
+
+ private:
+  static constexpr uint32_t kEmpty = ~0u;
+  void grow() {
+    std::vector<int64_t> old_keys = std::move(keys_);
+    std::vector<uint32_t> old_vals = std::move(vals_);
+    keys_.assign(std::max<size_t>(16, old_keys.size() * 2), 0);
+    vals_.assign(keys_.size(), kEmpty);
+    size_ = 0;
+    for (size_t i = 0; i < old_keys.size(); i++) {
+      if (old_vals[i] != kEmpty) findOrAdd(old_keys[i], [&] { return old_vals[i]; });
+    }
+  }
+  std::vector<int64_t> keys_;
+  std::vector<uint32_t> vals_;
+  size_t size_ = 0;
+};
+
+// What only some aggregates need, allocated on first use, so the common
+// state (count, sums, int / float min and max) stays small.
+struct VStateExtra {
+  std::string smin, smax;
+  IntSet idistinct;  // count_distinct
+  std::unordered_set<std::string> sdistinct;
+  std::vector<double> values;  // percentiles
+  HyperLogLog hll;             // approx_count_distinct
+  DDSketch sketch;             // approx percentiles
+};
+
 struct VState {
   int64_t count = 0;  // rows (count()) or non-null inputs
   int64_t isum = 0;
@@ -406,12 +503,11 @@ struct VState {
   bool seen = false;  // any non-null input
   int64_t imin = 0, imax = 0;
   double fmin = 0, fmax = 0;
-  std::string smin, smax;
-  std::unordered_set<int64_t> idistinct;  // count_distinct
-  std::unordered_set<std::string> sdistinct;
-  std::vector<double> values;  // percentiles
-  HyperLogLog hll;             // approx_count_distinct
-  DDSketch sketch;             // approx percentiles
+  std::unique_ptr<VStateExtra> x;
+  VStateExtra& extra() {
+    if (!x) x = std::make_unique<VStateExtra>();
+    return *x;
+  }
 };
 
 void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols, uint32_t i) {
@@ -436,7 +532,7 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
       break;
     case VFn::Min:
       if (c.type == Type::Text) {
-        if (first || c.textAt(i) < s.smin) s.smin = c.textAt(i);
+        if (first || c.textAt(i) < s.extra().smin) s.extra().smin = c.textAt(i);
       } else if (c.type == Type::Float) {
         if (first || c.floats[i] < s.fmin) s.fmin = c.floats[i];
       } else if (first || c.ints[i] < s.imin) {
@@ -445,7 +541,7 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
       break;
     case VFn::Max:
       if (c.type == Type::Text) {
-        if (first || c.textAt(i) > s.smax) s.smax = c.textAt(i);
+        if (first || c.textAt(i) > s.extra().smax) s.extra().smax = c.textAt(i);
       } else if (c.type == Type::Float) {
         if (first || c.floats[i] > s.fmax) s.fmax = c.floats[i];
       } else if (first || c.ints[i] > s.imax) {
@@ -453,20 +549,20 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
       }
       break;
     case VFn::CountDistinct:
-      if (c.type == Type::Text) s.sdistinct.emplace(c.textAt(i));
-      else s.idistinct.insert(c.ints[i]);
+      if (c.type == Type::Text) s.extra().sdistinct.emplace(c.textAt(i));
+      else s.extra().idistinct.insert(c.ints[i]);
       break;
     case VFn::Quantile:
-      s.values.push_back(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
+      s.extra().values.push_back(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
       break;
     case VFn::ApproxDistinct:
       // The same hashes as the row path (Value::hash), so both give one estimate.
-      if (c.type == Type::Text) s.hll.add(std::hash<std::string_view>()(c.textAt(i)));
-      else if (c.type == Type::Float) s.hll.add(Value::real(c.floats[i]).hash());
-      else s.hll.add(Value::integer(c.ints[i]).hash());
+      if (c.type == Type::Text) s.extra().hll.add(std::hash<std::string_view>()(c.textAt(i)));
+      else if (c.type == Type::Float) s.extra().hll.add(Value::real(c.floats[i]).hash());
+      else s.extra().hll.add(Value::integer(c.ints[i]).hash());
       break;
     case VFn::ApproxQuantile:
-      s.sketch.add(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
+      s.extra().sketch.add(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
       break;
     default:
       break;
@@ -476,18 +572,19 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
 // The same result values the row-at-a-time HashAggregate produces.
 Value finalValue(const VAgg& a, const VState& s) {
   if (a.fn == VFn::Count || a.fn == VFn::CountCol) return Value::integer(s.count);
-  if (a.fn == VFn::CountDistinct) return Value::integer(static_cast<int64_t>(s.idistinct.size() + s.sdistinct.size()));
-  if (a.fn == VFn::Quantile) return quantile(s.values, a.q);
-  if (a.fn == VFn::ApproxDistinct) return Value::integer(static_cast<int64_t>(s.hll.estimate()));
-  if (a.fn == VFn::ApproxQuantile) return s.sketch.count() ? Value::real(s.sketch.quantile(a.q)) : Value::null();
+  const VStateExtra* x = s.x.get();
+  if (a.fn == VFn::CountDistinct) return Value::integer(x ? static_cast<int64_t>(x->idistinct.size() + x->sdistinct.size()) : 0);
+  if (a.fn == VFn::Quantile) return x ? quantile(x->values, a.q) : Value::null();
+  if (a.fn == VFn::ApproxDistinct) return Value::integer(x ? static_cast<int64_t>(x->hll.estimate()) : 0);
+  if (a.fn == VFn::ApproxQuantile) return x && x->sketch.count() ? Value::real(x->sketch.quantile(a.q)) : Value::null();
   if (!s.seen) return Value::null();
   switch (a.fn) {
     case VFn::Sum: return a.type == Type::Float ? Value::real(s.fsum) : Value::integer(s.isum);
     case VFn::Avg: return Value::real(s.fsum / static_cast<double>(s.count));
     case VFn::Min:
-      return a.type == Type::Text ? Value::text(s.smin) : a.type == Type::Float ? Value::real(s.fmin) : Value::integer(s.imin);
+      return a.type == Type::Text ? Value::text(x->smin) : a.type == Type::Float ? Value::real(s.fmin) : Value::integer(s.imin);
     case VFn::Max:
-      return a.type == Type::Text ? Value::text(s.smax) : a.type == Type::Float ? Value::real(s.fmax) : Value::integer(s.imax);
+      return a.type == Type::Text ? Value::text(x->smax) : a.type == Type::Float ? Value::real(s.fmax) : Value::integer(s.imax);
     default: return Value::null();
   }
 }
@@ -538,25 +635,28 @@ void mergeState(const VAgg& a, VState& into, VState& from) {
     case VFn::Min:
       if (first || from.imin < into.imin) into.imin = from.imin;
       if (first || from.fmin < into.fmin) into.fmin = from.fmin;
-      if (first || from.smin < into.smin) into.smin = std::move(from.smin);
+      if (from.x && (first || from.x->smin < into.extra().smin)) into.extra().smin = std::move(from.x->smin);
       break;
     case VFn::Max:
       if (first || from.imax > into.imax) into.imax = from.imax;
       if (first || from.fmax > into.fmax) into.fmax = from.fmax;
-      if (first || from.smax > into.smax) into.smax = std::move(from.smax);
+      if (from.x && (first || from.x->smax > into.extra().smax)) into.extra().smax = std::move(from.x->smax);
       break;
     case VFn::CountDistinct:
-      into.idistinct.merge(from.idistinct);
-      into.sdistinct.merge(from.sdistinct);
+      if (from.x) {
+        VStateExtra& e = into.extra();
+        from.x->idistinct.forEach([&](int64_t k) { e.idistinct.insert(k); });
+        e.sdistinct.merge(from.x->sdistinct);
+      }
       break;
     case VFn::Quantile:
-      into.values.insert(into.values.end(), from.values.begin(), from.values.end());
+      if (from.x) into.extra().values.insert(into.extra().values.end(), from.x->values.begin(), from.x->values.end());
       break;
     case VFn::ApproxDistinct:
-      into.hll.merge(from.hll);
+      if (from.x) into.extra().hll.merge(from.x->hll);
       break;
     case VFn::ApproxQuantile:
-      into.sketch.merge(from.sketch);
+      if (from.x) into.extra().sketch.merge(from.x->sketch);
       break;
     default:
       break;
@@ -753,7 +853,7 @@ class VecAggregateOp : public Operator {
     int key_col = -1;
     int64_t width = 0;      // > 0: bucket(col, width) keys round down to multiples of it
     bool null_key = false;  // bucket() with a width <= 0 is null for every row
-    std::unordered_map<int64_t, uint32_t> int_groups;
+    IntMap int_groups;
     std::unordered_map<std::string, uint32_t> text_groups;
     std::vector<int64_t> code_groups;  // dictionary code -> group, -1 = none yet
     int64_t null_group = -1;
@@ -799,9 +899,7 @@ class VecAggregateOp : public Operator {
           int64_t x = kc.ints[i], b = x / width;
           if (x % width != 0 && x < 0) b--;
           b *= width;
-          auto it = int_groups.find(b);
-          if (it == int_groups.end()) it = int_groups.emplace(b, newGroup(Value::integer(b))).first;
-          g = it->second;
+          g = int_groups.findOrAdd(b, [&] { return newGroup(Value::integer(b)); });
         } else if (kc.type == Type::Text) {
           // Dictionary-coded keys index an array by code; other text hashes.
           int32_t code = kc.codeAt(i);
@@ -816,9 +914,7 @@ class VecAggregateOp : public Operator {
             g = it->second;
           }
         } else {
-          auto it = int_groups.find(kc.ints[i]);
-          if (it == int_groups.end()) it = int_groups.emplace(kc.ints[i], newGroup(kc.get(i))).first;
-          g = it->second;
+          g = int_groups.findOrAdd(kc.ints[i], [&] { return newGroup(kc.get(i)); });
         }
         for (size_t a = 0; a < aggs.size(); a++) updateState(aggs[a], out.groups[g][a], cols, i);
       }

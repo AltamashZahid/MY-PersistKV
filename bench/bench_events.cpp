@@ -5,9 +5,13 @@
 //
 //   bench_events [scale] [dir]     scale 1 = 1M events over 7 days
 //
-// Built with -DDUCKDB_DIR=<path to the libduckdb release>, it also runs
+// Built with -DDUCKDB_DIR=<path to the libduckdb release>, it can also run
 // every query on DuckDB (an embedded column store), with the same data,
-// all its threads and its own approximate functions.
+// all its threads and its own approximate functions. PKQL_BENCH_ENGINES
+// picks the engines of a run: "pkql,sqlite" (the default) or "duckdb".
+// Run DuckDB in its own process: in one process, its worker threads and
+// memory traffic slow the parallel scans of the engine timed after it
+// (PKQL's 7-day daily-active-users query took 154 ms there, 24 ms alone).
 
 #include <sqlite3.h>
 
@@ -107,18 +111,24 @@ int main(int argc, char** argv) {
     create table events (ts integer primary key, user_id integer, kind text, country text, amount real, latency integer);
     create index events_user on events (user_id);
   )");
+  std::string engines = std::getenv("PKQL_BENCH_ENGINES") ? std::getenv("PKQL_BENCH_ENGINES") : "pkql,sqlite";
+  bool use_main = engines.find("pkql") != std::string::npos;  // PKQL and SQLite
+  bool use_dk = engines.find("duckdb") != std::string::npos;
+  double pk_insert = 0, pk_analyze = 0, pk_load = 0, sq_load = 0;
   auto t0 = Clock::now();
+  if (use_main) {
   pk.insertRows("events", events);
-  double pk_insert = std::chrono::duration<double>(Clock::now() - t0).count();
+  pk_insert = std::chrono::duration<double>(Clock::now() - t0).count();
   pk.run("analyze");
-  double pk_analyze = std::chrono::duration<double>(Clock::now() - t0).count() - pk_insert;
+  pk_analyze = std::chrono::duration<double>(Clock::now() - t0).count() - pk_insert;
   pk.db().checkpoint();
-  double pk_load = std::chrono::duration<double>(Clock::now() - t0).count();
+  pk_load = std::chrono::duration<double>(Clock::now() - t0).count();
   t0 = Clock::now();
   sqlLoad(sq, "events", events);
   sqlExec(sq, "analyze");
   sqlExec(sq, "pragma wal_checkpoint(truncate)");
-  double sq_load = std::chrono::duration<double>(Clock::now() - t0).count();
+  sq_load = std::chrono::duration<double>(Clock::now() - t0).count();
+  }
   auto mb = [](const std::string& path) {
     std::error_code ec;
     return static_cast<double>(std::filesystem::file_size(path, ec)) / 1e6;
@@ -144,6 +154,7 @@ int main(int argc, char** argv) {
     duckdb_destroy_result(&r);
     return n;
   };
+  if (use_dk) {
   dkExec("create table events (ts bigint, user_id bigint, kind varchar, country varchar, amount double, latency bigint)");
   t0 = Clock::now();
   {
@@ -165,8 +176,14 @@ int main(int argc, char** argv) {
   double dk_load = std::chrono::duration<double>(Clock::now() - t0).count();
   std::printf("DuckDB %s: load + index + checkpoint %.2f s (%.0f events/s, %.1f MB)\n", duckdb_library_version(), dk_load,
               kEvents / dk_load, mb(dk_path));
+  }
+#else
+  if (use_dk) {
+    std::fprintf(stderr, "built without DuckDB (-DDUCKDB_DIR)\n");
+    return 1;
+  }
 #endif
-  std::printf(
+  if (use_main) std::printf(
       "Load + analyze: PKQL %.2f s (%.0f events/s, %.1f MB; insert %.2f s, analyze %.2f s, checkpoint %.2f s), "
       "SQLite %.2f s (%.0f events/s, %.1f MB)\n\n",
       pk_load, kEvents / pk_load, mb(pk_dir + "/data.db"), pk_insert, pk_analyze, pk_load - pk_insert - pk_analyze, sq_load,
@@ -261,50 +278,56 @@ int main(int argc, char** argv) {
        }},
   };
 
-#ifdef PKQL_BENCH_DUCKDB
-  std::printf("| Query | PKQL (ms) | SQLite (ms) | DuckDB (ms) | PKQL / SQLite | PKQL / DuckDB | PKQL plan |\n"
-              "|---|---|---|---|---|---|---|\n");
-#else
-  std::printf("| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite | PKQL plan |\n|---|---|---|---|---|\n");
-#endif
+  // Columns for the chosen engines, interleaved among them, median of 9.
+  if (use_main) {
+    std::printf("| Query | PKQL (ms) | SQLite (ms) |%s PKQL / SQLite |%s PKQL plan |\n|---|---|---|%s---|%s---|\n",
+                use_dk ? " DuckDB (ms) |" : "", use_dk ? " PKQL / DuckDB |" : "", use_dk ? "---|" : "", use_dk ? "---|" : "");
+  } else {
+    std::printf("| Query | DuckDB (ms) |\n|---|---|\n");
+  }
   for (const Q& q : qs) {
-    size_t pk_rows = 0, sq_rows = 0;
-    auto runPk = [&] {
-      pk_rows = 0;
-      for (int i = 0; i < q.repeat; i++) pk_rows += pk.run(q.pkql(i)).back().rows.size();
-    };
-    auto runSq = [&] {
-      sq_rows = 0;
-      for (int i = 0; i < q.repeat; i++) sq_rows += sqlRows(sq, q.sql(i));
-    };
+    std::vector<std::function<void()>> runs;
+    std::vector<size_t> rows;
+    rows.assign(3, 0);
+    if (use_main) {
+      runs.push_back([&] {
+        rows[0] = 0;
+        for (int i = 0; i < q.repeat; i++) rows[0] += pk.run(q.pkql(i)).back().rows.size();
+      });
+      runs.push_back([&] {
+        rows[1] = 0;
+        for (int i = 0; i < q.repeat; i++) rows[1] += sqlRows(sq, q.sql(i));
+      });
+    }
 #ifdef PKQL_BENCH_DUCKDB
-    size_t dk_rows = 0;
-    auto runDk = [&] {
-      dk_rows = 0;
-      for (int i = 0; i < q.repeat; i++) dk_rows += dkExec(q.duck ? q.duck(i) : q.sql(i));
-    };
-    // Three-way interleaving: PKQL, SQLite, DuckDB, PKQL, ...
-    runPk();
-    runSq();
-    runDk();
-    std::function<void()> engines[3] = {runPk, runSq, runDk};
-    std::vector<double> times[3];
-    for (int r = 0; r < 9; r++) {
-      for (int e = 0; e < 3; e++) {
+    if (use_dk) {
+      runs.push_back([&] {
+        rows[2] = 0;
+        for (int i = 0; i < q.repeat; i++) rows[2] += dkExec(q.duck ? q.duck(i) : q.sql(i));
+      });
+    }
+#endif
+    for (auto& r : runs) r();  // warm-up
+    std::vector<std::vector<double>> times(runs.size());
+    for (int rep = 0; rep < 9; rep++) {
+      for (size_t e = 0; e < runs.size(); e++) {
         auto t1 = Clock::now();
-        engines[e]();
+        runs[e]();
         times[e].push_back(std::chrono::duration<double, std::milli>(Clock::now() - t1).count());
       }
     }
-    double p = median(times[0]), sv = median(times[1]), d = median(times[2]);
-    std::printf("| %s | %.2f | %.2f | %.2f | %.2fx | %.2fx | %s |%s\n", q.name, p, sv, d, p / sv, p / d,
-                planSummary(pk, q.pkql(0)).c_str(),
-                pk_rows == sq_rows && pk_rows == dk_rows ? "" : "  <-- ROW COUNT MISMATCH");
-#else
-    auto t = interleavedMedians(9, runPk, runSq);
-    std::printf("| %s | %.2f | %.2f | %.2fx | %s |%s\n", q.name, t.first, t.second, t.first / t.second,
-                planSummary(pk, q.pkql(0)).c_str(), pk_rows == sq_rows ? "" : "  <-- ROW COUNT MISMATCH");
-#endif
+    std::vector<double> med;
+    for (auto& t : times) med.push_back(median(t));
+    if (!use_main) {
+      std::printf("| %s | %.2f |\n", q.name, med[0]);
+    } else if (!use_dk) {
+      std::printf("| %s | %.2f | %.2f | %.2fx | %s |%s\n", q.name, med[0], med[1], med[0] / med[1],
+                  planSummary(pk, q.pkql(0)).c_str(), rows[0] == rows[1] ? "" : "  <-- ROW COUNT MISMATCH");
+    } else {
+      std::printf("| %s | %.2f | %.2f | %.2f | %.2fx | %.2fx | %s |%s\n", q.name, med[0], med[1], med[2], med[0] / med[1],
+                  med[0] / med[2], planSummary(pk, q.pkql(0)).c_str(),
+                  rows[0] == rows[1] && rows[0] == rows[2] ? "" : "  <-- ROW COUNT MISMATCH");
+    }
     std::fflush(stdout);
   }
 #ifdef PKQL_BENCH_DUCKDB
