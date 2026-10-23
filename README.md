@@ -120,8 +120,8 @@ with machine load, so compare the ratios, which are measured interleaved.
 
 **PKQL beats SQLite on scans, aggregation, joins and point lookups** (1.6–3.8×
 faster), and is level on index lookups and key ranges. It is still slower on three:
-top 10 by an unindexed column (~1.2×, SQLite's sorter is tighter than PKQL's top-N
-kernel), "first 10" (microseconds in both engines, so fixed per-query overhead
+top 10 by an unindexed column (~1.2×, not yet profiled),
+"first 10" (microseconds in both engines, so fixed per-query overhead
 dominates), and the selective join (1.5–1.8×: about 1,300 lookups, bound by
 PersistKV's per-lookup cost when CPU caches are cold).
 
