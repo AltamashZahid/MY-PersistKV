@@ -310,6 +310,28 @@ void collectRowKeys(pkv::DB& db, const TableSchema& t, const IndexSchema& ix, st
   }
 }
 
+void sortKeys(std::vector<std::string>& keys) {
+  if (std::is_sorted(keys.begin(), keys.end())) return;
+  // Zero-padding a short key's prefix keeps prefix order consistent with
+  // bytewise order; equal prefixes fall back to the full comparison.
+  std::vector<std::pair<uint64_t, uint32_t>> order(keys.size());
+  for (size_t i = 0; i < keys.size(); i++) {
+    uint64_t prefix = 0;
+    for (size_t j = 0; j < 8; j++) {
+      prefix = (prefix << 8) | (j < keys[i].size() ? static_cast<uint8_t>(keys[i][j]) : 0);
+    }
+    order[i] = {prefix, static_cast<uint32_t>(i)};
+  }
+  std::sort(order.begin(), order.end(), [&](const auto& a, const auto& b) {
+    if (a.first != b.first) return a.first < b.first;
+    return keys[a.second] < keys[b.second];
+  });
+  std::vector<std::string> sorted;
+  sorted.reserve(keys.size());
+  for (const auto& o : order) sorted.push_back(std::move(keys[o.second]));
+  keys.swap(sorted);
+}
+
 // ---------------------------------------------------------------------------
 
 void Catalog::load() {

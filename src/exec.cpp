@@ -15,10 +15,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// A random lookup costs about this many raw scan steps (measured: ~0.8 us
-// vs ~11 ns, rounded down to stay conservative). Keep in sync with the
-// optimizer's kSkipRow.
-constexpr double kLookupVsSkip = 50.0;
+// A sorted, batched lookup costs about this many skipped rows (measured:
+// ~150-300 ns per key vs ~25-35 ns per skipped row). Keep in sync with the
+// optimizer's kBatchedLookup / kSkipRow.
+constexpr double kBatchedLookupVsSkip = 6.0;
 
 struct RowEq {
   bool operator()(const Row& a, const Row& b) const { return a == b; }
@@ -76,6 +76,8 @@ class KeyReader {
     rows_.reset();
     pending_keys_.clear();
     pending_pos_ = 0;
+    batched_ = false;
+    batch_pos_ = batch_count_ = 0;
     pred_ = pred;
     const std::vector<int>& cols = p_.index ? p_.index->cols : p_.table->pk;
     if (p_.point && !p_.index && eq.size() == cols.size()) {
@@ -100,20 +102,22 @@ class KeyReader {
     cursor_ = std::make_unique<Cursor>(db_, lo, hi);
   }
 
-  // Sorted index fetch (like a bitmap heap scan): when an index scan matches
-  // many rows, collect their keys, sort them, and read the table once in key
-  // order, decoding only those rows, instead of one random lookup per row.
-  // Chosen when matches x lookup cost exceeds one pass over the table.
+  // Sorted index fetch (like a bitmap heap scan): collect the matching row
+  // keys and sort them, then look them up in batches (neighbouring keys share
+  // leaf pages) or, when matches are dense, read the table once in key order
+  // decoding only those rows.
   void startSortedFetchIfCheaper(std::string index_lo, const std::string& index_hi) {
     std::vector<std::string> keys;
     collectRowKeys(db_, *p_.table, *p_.index, std::move(index_lo), index_hi, &keys);
+    sortKeys(keys);
     double table_rows = static_cast<double>(p_.table->stats.rows);
-    if (static_cast<double>(keys.size()) * kLookupVsSkip < table_rows) {
-      pending_keys_ = std::move(keys);  // few matches: look each one up
+    if (static_cast<double>(keys.size()) * kBatchedLookupVsSkip < table_rows) {
+      pending_keys_ = std::move(keys);  // look the matches up in key order, a batch at a time
       pending_pos_ = 0;
+      batched_ = true;
+      batch_size_ = 16;
       return;
     }
-    std::sort(keys.begin(), keys.end());
     std::string prefix = tablePrefix(p_.table->id);
     std::string lo = keys.empty() ? prefix : keys.front();
     std::string hi = keys.empty() ? prefix : prefixSuccessor(keys.back());
@@ -128,6 +132,14 @@ class KeyReader {
       return !pred_ || isTrue(eval(*pred_, *row));
     }
     if (rows_) return rows_->next(row);
+    if (batched_) {
+      while (batch_pos_ >= batch_count_) {
+        if (pending_pos_ >= pending_keys_.size()) return false;
+        fetchBatch();
+      }
+      std::swap(*row, batch_rows_[batch_pos_++]);  // hand the row over; take the caller's old buffer back
+      return true;
+    }
     while (pending_pos_ < pending_keys_.size()) {
       const std::string& rk = pending_keys_[pending_pos_++];
       if (!fetch(rk, row)) throw Error("index " + p_.index->name + " points at a missing row");
@@ -146,6 +158,26 @@ class KeyReader {
  private:
   const std::vector<bool>* needed() const { return p_.needed.empty() ? nullptr : &p_.needed; }
 
+  // Looks up the next batch of sorted row keys with one batched storage call
+  // and keeps the decoded rows that pass the filter.
+  void fetchBatch() {
+    size_t n = std::min(batch_size_, pending_keys_.size() - pending_pos_);
+    batch_size_ = std::min<size_t>(batch_size_ * 4, 1024);  // small first batch, for `take`
+    batch_keys_.assign(std::make_move_iterator(pending_keys_.begin() + static_cast<long>(pending_pos_)),
+                       std::make_move_iterator(pending_keys_.begin() + static_cast<long>(pending_pos_ + n)));
+    pending_pos_ += n;
+    batch_pos_ = batch_count_ = 0;
+    size_t found = 0;
+    db_.multiGetRaw(batch_keys_, [&](size_t i, const char* v, size_t len) {
+      found++;
+      if (batch_count_ == batch_rows_.size()) batch_rows_.emplace_back();
+      Row& r = batch_rows_[batch_count_];
+      decodeStoredRowInto(plan_, batch_keys_[i], std::string_view(v, len), r);
+      if (!pred_ || isTrue(eval(*pred_, r))) batch_count_++;
+    });
+    if (found != n) throw Error("index " + p_.index->name + " points at a missing row");
+  }
+
   // Looks a row up by key and decodes it straight from the cached page.
   bool fetch(const std::string& row_key, Row* row) {
     return db_.getRaw(row_key, [&](const char* v, size_t n) {
@@ -158,8 +190,13 @@ class KeyReader {
   DecodePlan plan_;
   std::unique_ptr<Cursor> cursor_;    // secondary-index entries
   std::unique_ptr<RowCursor> rows_;  // primary-key range (or sorted index fetch)
-  std::vector<std::string> pending_keys_;  // index matches to look up one by one
+  std::vector<std::string> pending_keys_;  // index matches to look up
   size_t pending_pos_ = 0;
+  bool batched_ = false;  // pending_keys_ are sorted and fetched in batches
+  size_t batch_size_ = 16;
+  std::vector<std::string> batch_keys_;
+  std::vector<Row> batch_rows_;
+  size_t batch_pos_ = 0, batch_count_ = 0;
   const Expr* pred_ = nullptr;
   std::string point_key_;
   bool point_pending_ = false;

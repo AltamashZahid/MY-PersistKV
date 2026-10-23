@@ -108,6 +108,12 @@ std::string rowKeyFromIndexEntry(const TableSchema& t, const IndexSchema& ix, st
 void collectRowKeys(pkv::DB& db, const TableSchema& t, const IndexSchema& ix, std::string lo, const std::string& hi,
                     std::vector<std::string>* out);
 
+// Sorts keys bytewise, much faster than std::sort on the strings: keys that
+// are already in order (an equality match on an index) are left as they are,
+// and others are ordered by their first 8 bytes, comparing whole keys only on
+// a tie.
+void sortKeys(std::vector<std::string>& keys);
+
 // ---------------------------------------------------------------------------
 // Catalog: the table schemas, persisted in the same store as the data.
 // ---------------------------------------------------------------------------

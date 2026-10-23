@@ -21,7 +21,9 @@ namespace {
 constexpr double kSeqRow = 1.0;
 constexpr double kLookup = 10.0;
 constexpr double kIndexEntry = 0.7;
-constexpr double kSkipRow = 0.2;  // passing over a row without decoding it (sorted index fetch)
+constexpr double kSkipRow = 0.5;  // passing over a row without decoding it (sorted index fetch)
+constexpr double kBatchedLookup = 3.0;  // one key of a sorted, batched lookup (multiGetRaw)
+constexpr double kKeySort = 1.2;        // sorting one row key for a sorted index fetch
 constexpr double kPred = 0.05;
 constexpr double kHashBuild = 1.5;
 constexpr double kHashProbe = 1.0;
@@ -531,10 +533,15 @@ PPtr Planner::planAccess(const LeafInfo& leaf, const std::vector<int>* wanted) {
     p->schema = leaf.schema;
     p->rows = p->point ? std::min(out_rows, 1.0) : out_rows;
     if (cand.index) {
-      // Fetch matches one lookup each, or (sorted index fetch) in one pass
-      // over the table that decodes only the matches: whichever is cheaper.
-      double sorted_fetch = n * kSkipRow + scanned * kSeqRow + sortCost(scanned);
-      double fetch = std::min(scanned * kLookup, sorted_fetch);
+      // Fetch matches one lookup each, or (sorted index fetch) sort their
+      // row keys and then look them up in batches, or read the table in one
+      // pass that skips the other rows: whichever is cheapest. Equality on
+      // every index column yields the row keys already sorted.
+      bool presorted = m.matched_cols == static_cast<int>(cand.key_cols.size()) && !m.lo && !m.hi;
+      double key_sort = presorted ? 0.0 : scanned * kKeySort;
+      double batched = scanned * (kBatchedLookup + kSeqRow) + key_sort;
+      double skipping = n * kSkipRow + scanned * kSeqRow + key_sort;
+      double fetch = std::min({scanned * kLookup, batched, skipping});
       p->cost = kLookup + scanned * kIndexEntry + fetch;
     } else {
       p->cost = p->point ? kLookup : kLookup + scanned * kSeqRow;
