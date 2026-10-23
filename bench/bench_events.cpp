@@ -4,6 +4,10 @@
 // alternate between the engines and the median of 9 is reported.
 //
 //   bench_events [scale] [dir]     scale 1 = 1M events over 7 days
+//
+// Built with -DDUCKDB_DIR=<path to the libduckdb release>, it also runs
+// every query on DuckDB (an embedded column store), with the same data,
+// all its threads and its own approximate functions.
 
 #include <sqlite3.h>
 
@@ -18,6 +22,10 @@
 #include "harness.h"
 #include "persistkv/file.h"
 #include "pkql/engine.h"
+
+#ifdef PKQL_BENCH_DUCKDB
+#include <duckdb.h>
+#endif
 
 using namespace pkql;
 using namespace bench;
@@ -96,6 +104,49 @@ int main(int argc, char** argv) {
     std::error_code ec;
     return static_cast<double>(std::filesystem::file_size(path, ec)) / 1e6;
   };
+#ifdef PKQL_BENCH_DUCKDB
+  std::string dk_path = dir + "/duckdb_events.db";
+  std::remove(dk_path.c_str());
+  std::remove((dk_path + ".wal").c_str());
+  duckdb_database dk_db;
+  duckdb_connection dk;
+  if (duckdb_open(dk_path.c_str(), &dk_db) != DuckDBSuccess || duckdb_connect(dk_db, &dk) != DuckDBSuccess) {
+    std::fprintf(stderr, "cannot open DuckDB\n");
+    return 1;
+  }
+  auto dkExec = [&](const std::string& sql) {
+    duckdb_result r;
+    if (duckdb_query(dk, sql.c_str(), &r) != DuckDBSuccess) {
+      std::string e = duckdb_result_error(&r);
+      duckdb_destroy_result(&r);
+      throw std::runtime_error("duckdb: " + e + " in " + sql);
+    }
+    size_t n = static_cast<size_t>(duckdb_row_count(&r));
+    duckdb_destroy_result(&r);
+    return n;
+  };
+  dkExec("create table events (ts bigint, user_id bigint, kind varchar, country varchar, amount double, latency bigint)");
+  t0 = Clock::now();
+  {
+    duckdb_appender app;
+    duckdb_appender_create(dk, nullptr, "events", &app);
+    for (const Row& r : events) {
+      duckdb_append_int64(app, r[0].asInt());
+      duckdb_append_int64(app, r[1].asInt());
+      duckdb_append_varchar(app, r[2].asText().c_str());
+      duckdb_append_varchar(app, r[3].asText().c_str());
+      duckdb_append_double(app, r[4].asFloat());
+      duckdb_append_int64(app, r[5].asInt());
+      duckdb_appender_end_row(app);
+    }
+    duckdb_appender_destroy(&app);
+  }
+  dkExec("create index events_user on events (user_id)");
+  dkExec("checkpoint");
+  double dk_load = std::chrono::duration<double>(Clock::now() - t0).count();
+  std::printf("DuckDB %s: load + index + checkpoint %.2f s (%.0f events/s, %.1f MB)\n", duckdb_library_version(), dk_load,
+              kEvents / dk_load, mb(dk_path));
+#endif
   std::printf(
       "Load + analyze: PKQL %.2f s (%.0f events/s, %.1f MB; insert %.2f s, analyze %.2f s, checkpoint %.2f s), "
       "SQLite %.2f s (%.0f events/s, %.1f MB)\n\n",
@@ -111,6 +162,7 @@ int main(int argc, char** argv) {
     const char* name;
     int repeat;
     std::function<std::string(int)> pkql, sql;
+    std::function<std::string(int)> duck;  // DuckDB's SQL, when it differs from SQLite's
   };
   std::vector<Q> qs = {
       {"last hour: events by kind", 1,
@@ -135,6 +187,10 @@ int main(int argc, char** argv) {
        [&](int) { return "from events | filter ts >= ago(6h) | group country { p = p95(latency), n = count() }"; },
        [&](int) {
          return "select country, percentile_cont(latency, 0.95), count(*) from events where ts >= " + ago(6 * kHour) +
+                " group by country";
+       },
+       [&](int) {
+         return "select country, quantile_cont(latency, 0.95), count(*) from events where ts >= " + ago(6 * kHour) +
                 " group by country";
        }},
       {"last 24h: top 10 users by events", 1,
@@ -164,37 +220,78 @@ int main(int argc, char** argv) {
        [&](int) { return "from events | group kind { p50 = median(latency), p99 = p99(latency) }"; },
        [&](int) {
          return "select kind, median(latency), percentile_cont(latency, 0.99) from events group by kind";
-       }},
+       },
+       [&](int) { return std::string("select kind, median(latency), quantile_cont(latency, 0.99) from events group by kind"); }},
       // SQLite has no approximate aggregates: it runs the exact query.
       {"7 days: daily active users, approx_count_distinct (SQLite exact)", 1,
        [&](int) { return "from events | group day = bucket(ts, 1d) { dau = approx_count_distinct(user_id) } | sort day"; },
        [&](int) {
          return "select ts - ts % 86400000 as day, count(distinct user_id) from events group by day order by day";
+       },
+       [&](int) {
+         return std::string(
+             "select ts - ts % 86400000 as day, approx_count_distinct(user_id) from events group by day order by day");
        }},
       {"7 days: approx p50 / p99 latency by kind (SQLite exact)", 1,
        [&](int) { return "from events | group kind { p50 = approx_median(latency), p99 = approx_p99(latency) }"; },
        [&](int) {
          return "select kind, median(latency), percentile_cont(latency, 0.99) from events group by kind";
+       },
+       [&](int) {
+         return std::string("select kind, approx_quantile(latency, 0.5), approx_quantile(latency, 0.99) from events group by kind");
        }},
   };
 
+#ifdef PKQL_BENCH_DUCKDB
+  std::printf("| Query | PKQL (ms) | SQLite (ms) | DuckDB (ms) | PKQL / SQLite | PKQL / DuckDB | PKQL plan |\n"
+              "|---|---|---|---|---|---|---|\n");
+#else
   std::printf("| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite | PKQL plan |\n|---|---|---|---|---|\n");
+#endif
   for (const Q& q : qs) {
     size_t pk_rows = 0, sq_rows = 0;
-    auto t = interleavedMedians(
-        9,
-        [&] {
-          pk_rows = 0;
-          for (int i = 0; i < q.repeat; i++) pk_rows += pk.run(q.pkql(i)).back().rows.size();
-        },
-        [&] {
-          sq_rows = 0;
-          for (int i = 0; i < q.repeat; i++) sq_rows += sqlRows(sq, q.sql(i));
-        });
+    auto runPk = [&] {
+      pk_rows = 0;
+      for (int i = 0; i < q.repeat; i++) pk_rows += pk.run(q.pkql(i)).back().rows.size();
+    };
+    auto runSq = [&] {
+      sq_rows = 0;
+      for (int i = 0; i < q.repeat; i++) sq_rows += sqlRows(sq, q.sql(i));
+    };
+#ifdef PKQL_BENCH_DUCKDB
+    size_t dk_rows = 0;
+    auto runDk = [&] {
+      dk_rows = 0;
+      for (int i = 0; i < q.repeat; i++) dk_rows += dkExec(q.duck ? q.duck(i) : q.sql(i));
+    };
+    // Three-way interleaving: PKQL, SQLite, DuckDB, PKQL, ...
+    runPk();
+    runSq();
+    runDk();
+    std::function<void()> engines[3] = {runPk, runSq, runDk};
+    std::vector<double> times[3];
+    for (int r = 0; r < 9; r++) {
+      for (int e = 0; e < 3; e++) {
+        auto t1 = Clock::now();
+        engines[e]();
+        times[e].push_back(std::chrono::duration<double, std::milli>(Clock::now() - t1).count());
+      }
+    }
+    double p = median(times[0]), sv = median(times[1]), d = median(times[2]);
+    std::printf("| %s | %.2f | %.2f | %.2f | %.2fx | %.2fx | %s |%s\n", q.name, p, sv, d, p / sv, p / d,
+                planSummary(pk, q.pkql(0)).c_str(),
+                pk_rows == sq_rows && pk_rows == dk_rows ? "" : "  <-- ROW COUNT MISMATCH");
+#else
+    auto t = interleavedMedians(9, runPk, runSq);
     std::printf("| %s | %.2f | %.2f | %.2fx | %s |%s\n", q.name, t.first, t.second, t.first / t.second,
                 planSummary(pk, q.pkql(0)).c_str(), pk_rows == sq_rows ? "" : "  <-- ROW COUNT MISMATCH");
+#endif
     std::fflush(stdout);
   }
+#ifdef PKQL_BENCH_DUCKDB
+  duckdb_disconnect(&dk);
+  duckdb_close(&dk_db);
+#endif
   sqlite3_close(sq);
   return 0;
 }
