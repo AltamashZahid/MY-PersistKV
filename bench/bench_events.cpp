@@ -48,11 +48,15 @@ int main(int argc, char** argv) {
 
   pkv::Options opts;
   opts.sync_writes = false;  // loading speed is measured, not durability
-  opts.cache_pages = 4096;   // 16 MB
+  // Page cache for PKQL and SQLite: 16 MB, or PKQL_BENCH_CACHE_MB (DuckDB
+  // manages its own memory, up to 80% of RAM by default).
+  const char* cache_env = std::getenv("PKQL_BENCH_CACHE_MB");
+  const long cache_mb = cache_env ? std::atol(cache_env) : 16;
+  opts.cache_pages = static_cast<size_t>(cache_mb) * 256;
   Engine pk(pk_dir, opts);
   sqlite3* sq = nullptr;
   sqlite3_open(sq_path.c_str(), &sq);
-  sqlExec(sq, "pragma journal_mode = wal; pragma synchronous = off; pragma cache_size = -16384;");  // 16 MB
+  sqlExec(sq, "pragma journal_mode = wal; pragma synchronous = off; pragma cache_size = -" + std::to_string(cache_mb * 1024) + ";");
 
   // Events spread over the last 7 days, ending now, in time order (as they
   // arrive). Kinds and countries are skewed, a few users are very active,
@@ -78,6 +82,21 @@ int main(int argc, char** argv) {
     double amount = k == 3 ? static_cast<double>(rng() % 50000) / 100.0 : 0.0;
     events.push_back({Value::integer(ts), Value::integer(user), Value::text(kinds[k]), Value::text(countries[rng() % 10]),
                       Value::real(amount), Value::integer(static_cast<int64_t>(latency(rng)))});
+  }
+
+  // PKQL_BENCH_CSV=<file>: also write the events as CSV (first line: the
+  // "now" they end at), for loading the same data into other databases
+  // (see bench_cockroach.py).
+  if (const char* csv = std::getenv("PKQL_BENCH_CSV")) {
+    if (std::FILE* f = std::fopen(csv, "w")) {
+      std::fprintf(f, "%lld\n", static_cast<long long>(now));
+      for (const Row& r : events) {
+        std::fprintf(f, "%lld,%lld,%s,%s,%.2f,%lld\n", static_cast<long long>(r[0].asInt()),
+                     static_cast<long long>(r[1].asInt()), r[2].asText().c_str(), r[3].asText().c_str(), r[4].asFloat(),
+                     static_cast<long long>(r[5].asInt()));
+      }
+      std::fclose(f);
+    }
   }
 
   pk.run(R"(
