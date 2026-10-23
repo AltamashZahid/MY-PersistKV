@@ -1,7 +1,11 @@
 #include "pkql/vector.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <exception>
+#include <mutex>
+#include <thread>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -366,7 +370,7 @@ struct VAgg {
 struct VState {
   int64_t count = 0;  // rows (count()) or non-null inputs
   int64_t isum = 0;
-  double fsum = 0;
+  FloatSum fsum;
   bool seen = false;  // any non-null input
   int64_t imin = 0, imax = 0;
   double fmin = 0, fmax = 0;
@@ -445,7 +449,66 @@ Value finalValue(const VAgg& a, const VState& s) {
 
 void tableRange(const PNode& scan, std::string* lo, std::string* hi) { tableScanRange(scan, lo, hi); }
 
+constexpr uint64_t kParallelMinRows = 100000;  // smaller scans run on one thread
+
+// Group keys in the merge: a Value hash map (null equals null; an Int key
+// never equals a Text key, since a group key column has one type).
+struct KeyHash {
+  size_t operator()(const Value& v) const {
+    uint64_t x = static_cast<uint64_t>(v.hash()) * 0x9e3779b97f4a7c15ull;
+    return static_cast<size_t>(x ^ (x >> 29));
+  }
+};
+struct KeyEq {
+  bool operator()(const Value& a, const Value& b) const {
+    return a.isNull() == b.isNull() && (a.isNull() || compare(a, b) == 0);
+  }
+};
+constexpr size_t kMaxThreads = 16;
+
+// Folds one partial aggregate state into another (merging morsels).
+void mergeState(const VAgg& a, VState& into, VState& from) {
+  if (!from.seen && a.fn != VFn::Count) {
+    into.count += from.count;
+    return;
+  }
+  bool first = !into.seen;
+  into.count += from.count;
+  into.isum += from.isum;
+  into.fsum += from.fsum;
+  into.seen = into.seen || from.seen;
+  switch (a.fn) {
+    case VFn::Min:
+      if (first || from.imin < into.imin) into.imin = from.imin;
+      if (first || from.fmin < into.fmin) into.fmin = from.fmin;
+      if (first || from.smin < into.smin) into.smin = std::move(from.smin);
+      break;
+    case VFn::Max:
+      if (first || from.imax > into.imax) into.imax = from.imax;
+      if (first || from.fmax > into.fmax) into.fmax = from.fmax;
+      if (first || from.smax > into.smax) into.smax = std::move(from.smax);
+      break;
+    case VFn::CountDistinct:
+      into.idistinct.merge(from.idistinct);
+      into.sdistinct.merge(from.sdistinct);
+      break;
+    case VFn::Quantile:
+      into.values.insert(into.values.end(), from.values.begin(), from.values.end());
+      break;
+    default:
+      break;
+  }
+}
+
 class VecAggregateOp : public Operator {
+  // One morsel's (or the whole scan's) groups, in first-seen order.
+  struct Partial {
+    std::vector<std::vector<VState>> groups;
+    std::vector<Value> keys;
+    std::vector<uint32_t> partition;  // per group: the merge partition its key hashes to
+    uint64_t passed = 0;
+  };
+
  public:
   VecAggregateOp(PNode& n, ExecContext& ctx) : Operator(n), ctx_(ctx) {
     for (const AggSpec& a : n.aggs) {
@@ -468,16 +531,140 @@ class VecAggregateOp : public Operator {
     }
   }
 
+  // Morsel-driven parallelism (Leis et al., "Morsel-Driven Parallelism",
+  // SIGMOD 2014): a large scan's key range is cut into morsels at B+Tree
+  // separators, worker threads take morsels from a shared counter and
+  // aggregate each into its own partial result, and the partials are merged
+  // in morsel order (so groups keep their first-seen order).
   void open() override {
     PNode& scan = *node_.kids[0];
     std::string lo, hi;
     tableRange(scan, &lo, &hi);
+    std::vector<std::string> bounds{lo};
+    size_t threads = 1;
+    // Only scans estimated to read many rows: starting threads costs more
+    // than a small time window takes to aggregate.
+    if (scan.cost >= static_cast<double>(kParallelMinRows)) {
+      threads = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), kMaxThreads));
+      if (threads > 1) {
+        // Several morsels per thread, so a slow one does not hold up the rest;
+        // but with many groups every morsel repeats most of them, so then
+        // one morsel per thread.
+        size_t per_thread = groupEstimate(scan) > 5000 ? 1 : 3;
+        std::vector<std::string> cuts = ctx_.db.splitPoints(lo, hi, threads * per_thread);
+        bounds.insert(bounds.end(), cuts.begin(), cuts.end());
+      }
+    }
+    bounds.push_back(hi);
+    size_t morsels = bounds.size() - 1;
+    threads = std::min(threads, morsels);
+    // When nearly every morsel would see nearly every group (e.g. top users
+    // of a day), splitting repeats the grouping work: scan on one thread.
+    if (threads > 1 && groupEstimate(scan) * static_cast<double>(threads) > scan.cost) {
+      threads = 1;
+      bounds = {lo, hi};
+      morsels = 1;
+    }
+    partitions_ = threads;
+
+    std::vector<Partial> parts(morsels);
+    if (threads <= 1) {
+      for (size_t m = 0; m < morsels; m++) aggregateRange(bounds[m], bounds[m + 1], parts[m]);
+    } else {
+      std::atomic<size_t> next{0};
+      std::exception_ptr error;
+      std::mutex error_mu;
+      auto work = [&] {
+        try {
+          for (size_t m; (m = next.fetch_add(1)) < morsels;) aggregateRange(bounds[m], bounds[m + 1], parts[m]);
+        } catch (...) {
+          std::lock_guard<std::mutex> lock(error_mu);
+          if (!error) error = std::current_exception();
+          next = morsels;  // the others stop early
+        }
+      };
+      std::vector<std::thread> pool;
+      for (size_t t = 1; t < threads; t++) pool.emplace_back(work);
+      work();
+      for (std::thread& t : pool) t.join();
+      if (error) std::rethrow_exception(error);
+    }
+
+    // Merge. With one morsel its groups are the result. Otherwise each
+    // thread merges one hash partition of the keys across all morsels (in
+    // morsel order), and the merged groups are put back in first-seen order
+    // by the (morsel, group) where each first appeared.
+    groups_.clear();
+    keys_.clear();
+    uint64_t passed = 0;
+    for (const Partial& part : parts) passed += part.passed;
+    if (parts.size() == 1) {
+      groups_ = std::move(parts[0].groups);
+      keys_ = std::move(parts[0].keys);
+    } else {
+      struct Merged {
+        uint64_t first;  // morsel << 32 | group index there
+        Value key;
+        std::vector<VState> states;
+      };
+      size_t partitions = threads;
+      std::vector<std::vector<Merged>> merged(partitions);
+      auto mergePartition = [&](size_t p) {
+        std::unordered_map<Value, uint32_t, KeyHash, KeyEq> index;
+        std::vector<Merged>& out = merged[p];
+        for (size_t m = 0; m < parts.size(); m++) {
+          Partial& part = parts[m];
+          for (size_t g = 0; g < part.groups.size(); g++) {
+            if (part.partition[g] != p) continue;  // computed up front: other threads move keys of their partitions
+            auto it = index.find(part.keys[g]);
+            if (it == index.end()) {
+              index.emplace(part.keys[g], static_cast<uint32_t>(out.size()));
+              out.push_back({(static_cast<uint64_t>(m) << 32) | g, std::move(part.keys[g]), std::move(part.groups[g])});
+              continue;
+            }
+            for (size_t a = 0; a < aggs_.size(); a++) mergeState(aggs_[a], out[it->second].states[a], part.groups[g][a]);
+          }
+        }
+      };
+      std::vector<std::thread> pool;
+      for (size_t p = 1; p < partitions; p++) pool.emplace_back(mergePartition, p);
+      mergePartition(0);
+      for (std::thread& t : pool) t.join();
+      std::vector<Merged> all;
+      for (auto& part : merged) {
+        for (Merged& mg : part) all.push_back(std::move(mg));
+      }
+      std::sort(all.begin(), all.end(), [](const Merged& a, const Merged& b) { return a.first < b.first; });
+      groups_.reserve(all.size());
+      keys_.reserve(all.size());
+      for (Merged& mg : all) {
+        keys_.push_back(std::move(mg.key));
+        groups_.push_back(std::move(mg.states));
+      }
+    }
+    if (node_.exprs.empty() && groups_.empty()) {  // `aggregate`: one row, even over zero rows
+      groups_.emplace_back(aggs_.size());
+      keys_.emplace_back();
+    }
+    scan.actual_rows = passed;
+    scan.executed = true;
+    pos_ = 0;
+  }
+
+  // Scans and aggregates the table rows in [lo, hi) into `out`.
+  void aggregateRange(const std::string& lo, const std::string& hi, Partial& out) const {
+    PNode& scan = *node_.kids[0];
     BatchScanner scanner(ctx_.db, *scan.table, lo, hi, scan.needed.empty() ? nullptr : &scan.needed);
     BatchFilter filter(scan.pred, scan.table->cols.size());
     filter.pushKernelsInto(scanner);
     std::vector<uint32_t> sel;
-    groups_.clear();
-    keys_.clear();
+    std::vector<std::vector<VState>>& groups = out.groups;
+    std::vector<Value>& keys = out.keys;
+    auto newGroup = [&](Value key) {
+      groups.emplace_back(aggs_.size());
+      keys.push_back(std::move(key));
+      return static_cast<uint32_t>(groups.size() - 1);
+    };
     // The key column, and for bucket(col, w) the width keys round down to.
     int key_col = -1;
     int64_t width = 0;      // > 0: round keys down to multiples of it
@@ -492,10 +679,7 @@ class VecAggregateOp : public Operator {
         key_col = k.index;
       }
     }
-    if (key_col < 0) {  // `aggregate`: one group, even over zero rows
-      groups_.emplace_back(aggs_.size());
-      keys_.emplace_back();
-    }
+    if (key_col < 0) newGroup(Value());  // `aggregate`: one group
     std::unordered_map<int64_t, uint32_t> int_groups;
     std::unordered_map<std::string, uint32_t> text_groups;
     std::vector<int64_t> code_groups;  // dictionary code -> group, -1 = none yet
@@ -506,7 +690,7 @@ class VecAggregateOp : public Operator {
       size_t m = filter.apply(scanner.cols, n, sel);
       passed += m;
       if (key_col < 0) {
-        std::vector<VState>& st = groups_[0];
+        std::vector<VState>& st = groups[0];
         for (size_t a = 0; a < aggs_.size(); a++) {
           for (size_t j = 0; j < m; j++) updateState(aggs_[a], st[a], scanner.cols, sel[j]);
         }
@@ -544,13 +728,16 @@ class VecAggregateOp : public Operator {
           if (it == int_groups.end()) it = int_groups.emplace(kc.ints[i], newGroup(kc.get(i))).first;
           g = it->second;
         }
-        for (size_t a = 0; a < aggs_.size(); a++) updateState(aggs_[a], groups_[g][a], scanner.cols, i);
+        for (size_t a = 0; a < aggs_.size(); a++) updateState(aggs_[a], groups[g][a], scanner.cols, i);
       }
     }
-    scan.actual_rows = passed;
-    scan.executed = true;
-    pos_ = 0;
+    out.passed = passed;
+    if (partitions_ > 1) {
+      out.partition.resize(keys.size());
+      for (size_t g = 0; g < keys.size(); g++) out.partition[g] = static_cast<uint32_t>(KeyHash()(keys[g]) % partitions_);
+    }
   }
+
 
   bool next(Row* row) override {
     if (pos_ >= groups_.size()) return false;
@@ -562,13 +749,19 @@ class VecAggregateOp : public Operator {
   }
 
  private:
-  uint32_t newGroup(Value key) {
-    groups_.emplace_back(aggs_.size());
-    keys_.push_back(std::move(key));
-    return static_cast<uint32_t>(groups_.size() - 1);
+  // Distinct group keys the statistics expect (1 for `aggregate`).
+  double groupEstimate(const PNode& scan) const {
+    if (node_.exprs.empty()) return 1;
+    const Expr& k = *node_.exprs[0];
+    int col = k.kind == ExprKind::Call ? k.args[0]->index : k.index;
+    if (k.kind == ExprKind::Call) return 1000;  // time buckets: few per morsel
+    const TableStats& st = scan.table->stats;
+    if (st.analyzed && static_cast<size_t>(col) < st.cols.size()) return static_cast<double>(st.cols[col].ndv);
+    return static_cast<double>(st.rows);  // unknown: assume many
   }
 
   ExecContext& ctx_;
+  size_t partitions_ = 1;  // merge partitions (= threads) for this run
   std::vector<VAgg> aggs_;
   std::vector<std::vector<VState>> groups_;  // in first-seen order
   std::vector<Value> keys_;

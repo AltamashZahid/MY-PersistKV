@@ -466,7 +466,7 @@ struct AggState {
   int64_t count = 0;
   bool is_float = false;
   int64_t isum = 0;
-  double fsum = 0;
+  FloatSum fsum;
   Value min, max;
   bool seen = false;  // any non-null input
   std::unordered_set<Row, RowHash, RowEq> distinct;

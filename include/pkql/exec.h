@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <memory>
 
 #include "persistkv/db.h"
@@ -27,6 +28,27 @@ struct ExecContext {
 };
 
 std::unique_ptr<Operator> buildOperator(PNode& plan, ExecContext& ctx);
+
+// Float sums with Kahan-Babuska-Neumaier compensation (Neumaier, 1974): the
+// low-order bits each addition rounds away are collected in `c`, so the
+// result hardly depends on the order of the additions (row by row, or
+// merged from parallel morsels) and stays accurate over millions of rows.
+// SQLite's sum() does the same since 3.43.
+struct FloatSum {
+  double sum = 0, c = 0;
+  FloatSum& operator+=(double x) {
+    double t = sum + x;
+    c += std::fabs(sum) >= std::fabs(x) ? (sum - t) + x : (x - t) + sum;
+    sum = t;
+    return *this;
+  }
+  FloatSum& operator+=(const FloatSum& o) {
+    *this += o.sum;
+    *this += o.c;
+    return *this;
+  }
+  operator double() const { return sum + c; }
+};
 
 // Percentile aggregates (median, p90, p95, p99): the fraction each asks for,
 // and the exact value, interpolated like percentile_cont (null if empty).

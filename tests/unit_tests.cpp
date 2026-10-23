@@ -380,6 +380,37 @@ TEST(time_ranges_use_the_key_and_stay_fresh) {
   CHECK(db.planCacheHits() > 0);
 }
 
+TEST(parallel_aggregation_matches_row_path) {
+  // Large enough to run on several threads: morsels, per-thread partials and
+  // the partitioned merge must give the row path's result in its order.
+  Engine db(freshDir("parallel_agg"), fast());
+  db.run("table ev (ts: int key, user_id: int, kind: text, ms: float?)");
+  std::vector<Row> rows;
+  std::mt19937 rng(8);
+  const char* kinds[] = {"view", "click", "buy", "refund"};
+  for (int i = 0; i < 150000; i++) {
+    rows.push_back({Value::integer(i * 1000LL), Value::integer(rng() % (i % 3 ? 40 : 4000)), Value::text(kinds[rng() % 4]),
+                    rng() % 17 == 0 ? Value::null() : Value::real(static_cast<double>(rng() % 10000) / 10.0)});
+  }
+  db.insertRows("ev", rows);
+  db.run("analyze");
+  const char* queries[] = {
+      "from ev | group kind { n = count(), s = sum(ms), lo = min(ms), u = count_distinct(user_id), p = p95(ms) }",
+      "from ev | group h = bucket(ts, 1h) { n = count(), m = median(ms), k = count_distinct(kind) }",
+      "from ev | filter kind != \"refund\" | group user_id { n = count(), hi = max(kind) }",
+      "from ev | aggregate { n = count(), u = count_distinct(user_id), q = p99(ms), a = avg(ms) }",
+      "from ev | filter ts > 1000000000000 | aggregate { n = count() }",  // no rows
+  };
+  for (const char* q : queries) {
+    CHECK(has(plan(db, q), "[vectorized]"));
+    std::string vec = db.run(q).back().format();
+    db.plannerOptions().vectorize = false;
+    std::string rowwise = db.run(q).back().format();
+    db.plannerOptions().vectorize = true;
+    CHECK(vec.substr(0, vec.rfind('(')) == rowwise.substr(0, rowwise.rfind('(')));
+  }
+}
+
 TEST(dictionary_encoded_text) {
   std::string dir = freshDir("dict");
   {
