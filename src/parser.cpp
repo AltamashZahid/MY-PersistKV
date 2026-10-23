@@ -166,7 +166,8 @@ std::vector<Token> lex(std::string_view src) {
 // Parser
 // ---------------------------------------------------------------------------
 
-const char* kAggregates[] = {"count", "sum", "avg", "min", "max", "count_distinct", "median", "p90", "p95", "p99"};
+const char* kAggregates[] = {"count", "sum", "avg", "min", "max", "count_distinct", "median", "p90", "p95", "p99",
+                             "approx_count_distinct", "approx_median", "approx_p90", "approx_p95", "approx_p99"};
 
 bool isAggregate(const std::string& s) {
   for (const char* a : kAggregates) {
@@ -453,9 +454,11 @@ class Parser {
         a.name = take().text;
         p_++;
       }
-      a.fn = ident("an aggregate (count, sum, avg, min, max, count_distinct, median, p90, p95, p99)");
+      a.fn = ident("an aggregate (count, sum, avg, min, max, count_distinct, median, p90, p95, p99, approx_...)");
       if (!isAggregate(a.fn)) {
-        fail("`" + a.fn + "` is not an aggregate (count, sum, avg, min, max, count_distinct, median, p90, p95, p99)");
+        fail("`" + a.fn +
+             "` is not an aggregate (count, sum, avg, min, max, count_distinct, median, p90, p95, p99, "
+             "approx_count_distinct, approx_median, approx_p90, approx_p95, approx_p99)");
       }
       expectSym("(");
       if (!isSym(")")) a.arg = expr();

@@ -165,6 +165,17 @@ int main(int argc, char** argv) {
        [&](int) {
          return "select kind, median(latency), percentile_cont(latency, 0.99) from events group by kind";
        }},
+      // SQLite has no approximate aggregates: it runs the exact query.
+      {"7 days: daily active users, approx_count_distinct (SQLite exact)", 1,
+       [&](int) { return "from events | group day = bucket(ts, 1d) { dau = approx_count_distinct(user_id) } | sort day"; },
+       [&](int) {
+         return "select ts - ts % 86400000 as day, count(distinct user_id) from events group by day order by day";
+       }},
+      {"7 days: approx p50 / p99 latency by kind (SQLite exact)", 1,
+       [&](int) { return "from events | group kind { p50 = approx_median(latency), p99 = approx_p99(latency) }"; },
+       [&](int) {
+         return "select kind, median(latency), percentile_cont(latency, 0.99) from events group by kind";
+       }},
   };
 
   std::printf("| Query | PKQL (ms) | SQLite (ms) | PKQL / SQLite | PKQL plan |\n|---|---|---|---|---|\n");

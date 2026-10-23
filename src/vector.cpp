@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <exception>
 #include <mutex>
@@ -11,6 +12,7 @@
 #include <unordered_set>
 
 #include "pkql/codec.h"
+#include "pkql/sketch.h"
 #include "pkql/storage.h"
 
 namespace pkql {
@@ -358,7 +360,7 @@ class BatchFilter {
 // bucket of an Int column (bucket(ts, 1h)).
 // ---------------------------------------------------------------------------
 
-enum class VFn { Count, CountCol, Sum, Avg, Min, Max, CountDistinct, Quantile };
+enum class VFn { Count, CountCol, Sum, Avg, Min, Max, CountDistinct, Quantile, ApproxDistinct, ApproxQuantile };
 
 struct VAgg {
   VFn fn;
@@ -378,6 +380,8 @@ struct VState {
   std::unordered_set<int64_t> idistinct;  // count_distinct
   std::unordered_set<std::string> sdistinct;
   std::vector<double> values;  // percentiles
+  HyperLogLog hll;             // approx_count_distinct
+  DDSketch sketch;             // approx percentiles
 };
 
 void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols, uint32_t i) {
@@ -425,6 +429,15 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
     case VFn::Quantile:
       s.values.push_back(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
       break;
+    case VFn::ApproxDistinct:
+      // The same hashes as the row path (Value::hash), so both give one estimate.
+      if (c.type == Type::Text) s.hll.add(std::hash<std::string_view>()(c.textAt(i)));
+      else if (c.type == Type::Float) s.hll.add(Value::real(c.floats[i]).hash());
+      else s.hll.add(Value::integer(c.ints[i]).hash());
+      break;
+    case VFn::ApproxQuantile:
+      s.sketch.add(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
+      break;
     default:
       break;
   }
@@ -435,6 +448,8 @@ Value finalValue(const VAgg& a, const VState& s) {
   if (a.fn == VFn::Count || a.fn == VFn::CountCol) return Value::integer(s.count);
   if (a.fn == VFn::CountDistinct) return Value::integer(static_cast<int64_t>(s.idistinct.size() + s.sdistinct.size()));
   if (a.fn == VFn::Quantile) return quantile(s.values, a.q);
+  if (a.fn == VFn::ApproxDistinct) return Value::integer(static_cast<int64_t>(s.hll.estimate()));
+  if (a.fn == VFn::ApproxQuantile) return s.sketch.count() ? Value::real(s.sketch.quantile(a.q)) : Value::null();
   if (!s.seen) return Value::null();
   switch (a.fn) {
     case VFn::Sum: return a.type == Type::Float ? Value::real(s.fsum) : Value::integer(s.isum);
@@ -466,6 +481,18 @@ struct KeyEq {
 };
 constexpr size_t kMaxThreads = 16;
 
+// Threads for parallel scans: the hardware's, at most kMaxThreads, or the
+// PKQL_THREADS environment variable (1 turns parallelism off).
+size_t workerThreads() {
+  static const size_t n = [] {
+    const char* env = std::getenv("PKQL_THREADS");
+    size_t hw = std::max<size_t>(1, std::thread::hardware_concurrency());
+    size_t want = env ? static_cast<size_t>(std::strtoul(env, nullptr, 10)) : hw;
+    return std::max<size_t>(1, std::min(want, kMaxThreads));
+  }();
+  return n;
+}
+
 // Folds one partial aggregate state into another (merging morsels).
 void mergeState(const VAgg& a, VState& into, VState& from) {
   if (!from.seen && a.fn != VFn::Count) {
@@ -495,6 +522,12 @@ void mergeState(const VAgg& a, VState& into, VState& from) {
     case VFn::Quantile:
       into.values.insert(into.values.end(), from.values.begin(), from.values.end());
       break;
+    case VFn::ApproxDistinct:
+      into.hll.merge(from.hll);
+      break;
+    case VFn::ApproxQuantile:
+      into.sketch.merge(from.sketch);
+      break;
     default:
       break;
   }
@@ -519,8 +552,9 @@ class VecAggregateOp : public Operator {
       else if (a.fn == "min") v.fn = VFn::Min;
       else if (a.fn == "max") v.fn = VFn::Max;
       else if (a.fn == "count_distinct") v.fn = VFn::CountDistinct;
+      else if (a.fn == "approx_count_distinct") v.fn = VFn::ApproxDistinct;
       else {
-        v.fn = VFn::Quantile;
+        v.fn = a.fn.compare(0, 7, "approx_") == 0 ? VFn::ApproxQuantile : VFn::Quantile;
         v.q = quantileOf(a.fn);
       }
       if (a.arg) {
@@ -545,7 +579,7 @@ class VecAggregateOp : public Operator {
     // Only scans estimated to read many rows: starting threads costs more
     // than a small time window takes to aggregate.
     if (scan.cost >= static_cast<double>(kParallelMinRows)) {
-      threads = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), kMaxThreads));
+      threads = workerThreads();
       if (threads > 1) {
         // Several morsels per thread, so a slow one does not hold up the rest;
         // but with many groups every morsel repeats most of them, so then
@@ -897,9 +931,10 @@ bool vectorizable(const PNode& p) {
       }
     }
     for (const AggSpec& a : p.aggs) {
-      bool pct = a.fn == "median" || a.fn == "p90" || a.fn == "p95" || a.fn == "p99";
+      bool pct = a.fn == "median" || a.fn == "p90" || a.fn == "p95" || a.fn == "p99" || a.fn == "approx_median" ||
+                 a.fn == "approx_p90" || a.fn == "approx_p95" || a.fn == "approx_p99";
       if (a.fn != "count" && a.fn != "sum" && a.fn != "avg" && a.fn != "min" && a.fn != "max" &&
-          a.fn != "count_distinct" && !pct) {
+          a.fn != "count_distinct" && a.fn != "approx_count_distinct" && !pct) {
         return false;
       }
       if (!a.arg) {

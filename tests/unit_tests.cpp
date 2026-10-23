@@ -380,6 +380,53 @@ TEST(time_ranges_use_the_key_and_stay_fresh) {
   CHECK(db.planCacheHits() > 0);
 }
 
+TEST(approximate_aggregates_stay_within_their_bounds) {
+  Engine db(freshDir("approx"), fast());
+  db.run("table ev (id: int key, g: int, u: int, x: float)");
+  std::vector<Row> rows;
+  std::vector<std::vector<double>> xs(4);
+  std::mt19937 rng(11);
+  std::lognormal_distribution<double> tail(3.0, 1.2);
+  const int64_t cards[] = {10, 1500, 50000, 200000};  // distinct u per group: sparse, sparse, dense, dense
+  for (int i = 0; i < 250000; i++) {
+    int g = i % 4;
+    double x = i % 50 == 0 ? 0.0 : (i % 7 == 0 ? -tail(rng) : tail(rng));  // zeros, negatives, a long tail
+    xs[g].push_back(x);
+    rows.push_back({Value::integer(i), Value::integer(g), Value::integer(static_cast<int64_t>(rng() % cards[g])), Value::real(x)});
+  }
+  db.insertRows("ev", rows);
+  db.run("analyze");
+  const char* q = "from ev | group g { d = approx_count_distinct(u), e = count_distinct(u), m = approx_median(x), "
+                  "p = approx_p99(x), n = approx_p90(x) } | sort g";
+  for (int vectorize = 1; vectorize >= 0; vectorize--) {
+    db.plannerOptions().vectorize = vectorize == 1;
+    Result r = db.run(q).back();
+    CHECK(r.rows.size() == 4);
+    for (size_t g = 0; g < r.rows.size() && g < 4; g++) {
+      double approx = static_cast<double>(r.rows[g][1].asInt()), exact = static_cast<double>(r.rows[g][2].asInt());
+      if (exact <= 2048) CHECK(approx == exact);  // the sparse form is exact
+      else CHECK(std::fabs(approx - exact) / exact < 0.03);
+      std::vector<double> v = xs[g];
+      std::sort(v.begin(), v.end());
+      const double qs[] = {0.5, 0.99, 0.9};
+      for (int k = 0; k < 3; k++) {
+        double truth = v[static_cast<size_t>(qs[k] * static_cast<double>(v.size() - 1))];
+        double got = r.rows[g][3 + k].asFloat();
+        CHECK(std::fabs(got - truth) <= 0.0101 * std::fabs(truth) + 1e-9);  // DDSketch: 1% relative
+      }
+    }
+  }
+  db.plannerOptions().vectorize = true;
+  // Merged sketches (parallel morsels) answer exactly as one built row by row.
+  std::string a = db.run(q).back().format();
+  db.plannerOptions().vectorize = false;
+  std::string b = db.run(q).back().format();
+  db.plannerOptions().vectorize = true;
+  CHECK(a.substr(0, a.rfind('(')) == b.substr(0, b.rfind('(')));
+  CHECK(cell(db, "from ev | filter id < 0 | aggregate { d = approx_count_distinct(u) }") == "0");
+  CHECK(cell(db, "from ev | filter id < 0 | aggregate { p = approx_p95(x) }") == "null");
+}
+
 TEST(parallel_aggregation_matches_row_path) {
   // Large enough to run on several threads: morsels, per-thread partials and
   // the partitioned merge must give the row path's result in its order.

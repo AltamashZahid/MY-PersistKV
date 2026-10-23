@@ -75,7 +75,8 @@ namespace {
 
 bool isAggregateName(const std::string& n) {
   return n == "count" || n == "sum" || n == "avg" || n == "min" || n == "max" || n == "count_distinct" ||
-         n == "median" || n == "p90" || n == "p95" || n == "p99";
+         n == "median" || n == "p90" || n == "p95" || n == "p99" || n == "approx_count_distinct" ||
+         n == "approx_median" || n == "approx_p90" || n == "approx_p95" || n == "approx_p99";
 }
 
 bool numeric(Type t) { return t == Type::Int || t == Type::Float; }

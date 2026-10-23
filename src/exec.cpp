@@ -1,4 +1,5 @@
 #include "pkql/exec.h"
+#include "pkql/sketch.h"
 
 #include <algorithm>
 #include <chrono>
@@ -450,7 +451,7 @@ class NestedLoopJoinOp : public Operator {
   bool have_left_ = false, matched_ = false;
 };
 
-enum class AggFn { Count, CountArg, Sum, Avg, Min, Max, CountDistinct, Quantile };
+enum class AggFn { Count, CountArg, Sum, Avg, Min, Max, CountDistinct, Quantile, ApproxDistinct, ApproxQuantile };
 
 AggFn aggKind(const AggSpec& a) {
   if (a.fn == "count") return a.arg ? AggFn::CountArg : AggFn::Count;
@@ -459,6 +460,8 @@ AggFn aggKind(const AggSpec& a) {
   if (a.fn == "min") return AggFn::Min;
   if (a.fn == "max") return AggFn::Max;
   if (a.fn == "count_distinct") return AggFn::CountDistinct;
+  if (a.fn == "approx_count_distinct") return AggFn::ApproxDistinct;
+  if (a.fn.compare(0, 7, "approx_") == 0) return AggFn::ApproxQuantile;
   return AggFn::Quantile;
 }
 
@@ -471,6 +474,8 @@ struct AggState {
   bool seen = false;  // any non-null input
   std::unordered_set<Row, RowHash, RowEq> distinct;
   std::vector<double> values;  // percentiles
+  HyperLogLog hll;             // approx_count_distinct
+  DDSketch sketch;             // approx_median / p90 / p95 / p99
 };
 
 class HashAggregateOp : public Operator {
@@ -551,6 +556,12 @@ class HashAggregateOp : public Operator {
       case AggFn::Quantile:
         s.values.push_back(v.asNumber());
         break;
+      case AggFn::ApproxDistinct:
+        s.hll.add(v.hash());
+        break;
+      case AggFn::ApproxQuantile:
+        s.sketch.add(v.asNumber());
+        break;
       default:
         break;
     }
@@ -559,11 +570,13 @@ class HashAggregateOp : public Operator {
   static Value result(const AggSpec& a, const AggState& s) {
     if (a.fn == "count") return Value::integer(s.count);
     if (a.fn == "count_distinct") return Value::integer(static_cast<int64_t>(s.distinct.size()));
+    if (a.fn == "approx_count_distinct") return Value::integer(static_cast<int64_t>(s.hll.estimate()));
     if (!s.seen) return Value::null();
     if (a.fn == "sum") return s.is_float || a.arg->type == Type::Float ? Value::real(s.fsum) : Value::integer(s.isum);
     if (a.fn == "avg") return Value::real(s.fsum / static_cast<double>(s.count));
     if (a.fn == "min") return s.min;
     if (a.fn == "max") return s.max;
+    if (a.fn.compare(0, 7, "approx_") == 0) return Value::real(s.sketch.quantile(quantileOf(a.fn)));
     return quantile(s.values, quantileOf(a.fn));
   }
 
@@ -714,9 +727,10 @@ class Instrumented : public Operator {
 
 // The fraction a percentile aggregate asks for.
 double quantileOf(const std::string& fn) {
-  if (fn == "p90") return 0.90;
-  if (fn == "p95") return 0.95;
-  if (fn == "p99") return 0.99;
+  std::string f = fn.compare(0, 7, "approx_") == 0 ? fn.substr(7) : fn;
+  if (f == "p90") return 0.90;
+  if (f == "p95") return 0.95;
+  if (f == "p99") return 0.99;
   return 0.5;  // median
 }
 

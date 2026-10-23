@@ -10,6 +10,7 @@
 
 #include "pkql/codec.h"
 #include "pkql/exec.h"
+#include "pkql/sketch.h"
 
 namespace pkql {
 
@@ -630,51 +631,9 @@ Result Engine::modify(const Statement&, const Pipeline& p) {
 // Statistics
 // ---------------------------------------------------------------------------
 
-namespace {
-
-// HyperLogLog estimate of a column's distinct values: 2^14 one-byte
-// registers (16 KB, about 0.8% error), with linear counting for small sets,
-// where it is nearly exact. An exact hash set cost one allocation per value.
-class DistinctEstimator {
- public:
-  void add(uint64_t h) {
-    h = mix(h);
-    size_t idx = static_cast<size_t>(h >> (64 - kBits));
-    uint64_t rest = (h << kBits) | (1ull << (kBits - 1));  // a guard bit bounds the rank
-    uint8_t rank = static_cast<uint8_t>(std::countl_zero(rest) + 1);
-    if (rank > reg_[idx]) reg_[idx] = rank;
-  }
-  uint64_t estimate() const {
-    double sum = 0;
-    size_t zeros = 0;
-    for (uint8_t r : reg_) {
-      sum += std::ldexp(1.0, -r);
-      zeros += r == 0;
-    }
-    double m = static_cast<double>(kM);
-    double e = 0.7213 / (1 + 1.079 / m) * m * m / sum;
-    if (e <= 2.5 * m && zeros > 0) e = m * std::log(m / static_cast<double>(zeros));
-    return static_cast<uint64_t>(std::llround(e));
-  }
-
- private:
-  static constexpr int kBits = 14;
-  static constexpr size_t kM = size_t{1} << kBits;
-  static uint64_t mix(uint64_t x) {  // splitmix64 finalizer: std::hash of an int is the identity
-    x ^= x >> 30;
-    x *= 0xbf58476d1ce4e5b9ull;
-    x ^= x >> 27;
-    x *= 0x94d049bb133111ebull;
-    return x ^ (x >> 31);
-  }
-  std::vector<uint8_t> reg_ = std::vector<uint8_t>(kM, 0);
-};
-
-}  // namespace
-
 void Engine::analyzeTable(TableSchema& t) {
   size_t ncols = t.cols.size();
-  std::vector<DistinctEstimator> distinct(ncols);
+  std::vector<HyperLogLog> distinct(ncols);  // exact for small columns, then ~0.8% error
   std::vector<std::vector<Value>> sample(ncols);
   std::vector<uint64_t> nulls(ncols, 0);
   uint64_t rows = 0;

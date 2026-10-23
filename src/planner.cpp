@@ -146,10 +146,11 @@ class LogicalPlanner {
           c.name = a.name;
           if (a.arg) spec.arg = foldConstants(bindExpr(a.arg, in->schema));
           Type t = spec.arg ? spec.arg->type : Type::Null;
-          if (a.fn == "count" || a.fn == "count_distinct") {
+          bool approx_pct = a.fn == "approx_median" || a.fn == "approx_p90" || a.fn == "approx_p95" || a.fn == "approx_p99";
+          if (a.fn == "count" || a.fn == "count_distinct" || a.fn == "approx_count_distinct") {
             c.type = Type::Int;
             c.nullable = false;
-          } else if (a.fn == "avg" || a.fn == "median" || a.fn == "p90" || a.fn == "p95" || a.fn == "p99") {
+          } else if (a.fn == "avg" || a.fn == "median" || a.fn == "p90" || a.fn == "p95" || a.fn == "p99" || approx_pct) {
             if (t != Type::Int && t != Type::Float) throw Error(a.fn + "() needs a number");
             c.type = Type::Float;
           } else if (a.fn == "sum") {
@@ -160,7 +161,7 @@ class LogicalPlanner {
           }
           // An aggregate over a group is null only if every input is null, or
           // if `aggregate` runs over zero rows.
-          if (a.fn != "count" && a.fn != "count_distinct") c.nullable = true;
+          if (a.fn != "count" && a.fn != "count_distinct" && a.fn != "approx_count_distinct") c.nullable = true;
           n->aggs.push_back(spec);
           n->schema.push_back(c);
         }
