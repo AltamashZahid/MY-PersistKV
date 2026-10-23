@@ -28,6 +28,11 @@ struct ExecContext {
 
 std::unique_ptr<Operator> buildOperator(PNode& plan, ExecContext& ctx);
 
+// Percentile aggregates (median, p90, p95, p99): the fraction each asks for,
+// and the exact value, interpolated like percentile_cont (null if empty).
+double quantileOf(const std::string& fn);
+Value quantile(std::vector<double> values, double q);
+
 // The encoded key range [lo, hi) a primary-key TableScan node reads.
 void tableScanRange(const PNode& scan, std::string* lo, std::string* hi);
 

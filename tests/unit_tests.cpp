@@ -363,6 +363,32 @@ TEST(time_ranges_use_the_key_and_stay_fresh) {
   CHECK(db.planCacheHits() > 0);
 }
 
+TEST(vectorized_time_aggregates_match_row_path) {
+  Engine db(freshDir("vec_time"), fast());
+  db.run("table ev (id: int key, ts: int?, user_id: int, kind: text, ms: float?)");
+  std::vector<Row> rows;
+  for (int i = 0; i < 3000; i++) {
+    Value ts = i % 50 == 0 ? Value::null() : Value::integer(static_cast<int64_t>(i) * 977 - 400000);  // some below 0
+    Value ms = i % 13 == 0 ? Value::null() : Value::real((i * 37) % 1000 / 10.0);
+    rows.push_back({Value::integer(i), ts, Value::integer(i % 97), Value::text(i % 3 ? "view" : "buy"), ms});
+  }
+  db.insertRows("ev", rows);
+  const char* queries[] = {
+      "from ev | group b = bucket(ts, 1m) { n = count(), u = count_distinct(user_id), p = p95(ms), m = median(ms) } | sort b",
+      "from ev | group b = bucket(ts, 0) { n = count() } | sort b",
+      "from ev | filter kind == \"buy\" | group b = bucket(ts, 7s) { s = sum(ms), k = count_distinct(kind) } | sort b",
+      "from ev | aggregate { u = count_distinct(user_id), q = p99(ms), k = count_distinct(kind) }",
+  };
+  for (const char* q : queries) {
+    CHECK(has(plan(db, q), "[vectorized]"));
+    std::string vec = db.run(q).back().format();
+    db.plannerOptions().vectorize = false;
+    std::string rowwise = db.run(q).back().format();
+    db.plannerOptions().vectorize = true;
+    CHECK(vec.substr(0, vec.rfind('(')) == rowwise.substr(0, rowwise.rfind('(')));  // ignore the timing
+  }
+}
+
 TEST(descending_sorts_read_scans_backwards) {
   Engine db(freshDir("reverse"), fast());
   db.run("table ev (ts: int key, user_id: int, kind: text) \n index ev_user on ev (user_id)");

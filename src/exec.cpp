@@ -462,27 +462,6 @@ AggFn aggKind(const AggSpec& a) {
   return AggFn::Quantile;
 }
 
-// The fraction a percentile aggregate asks for.
-double quantileOf(const std::string& fn) {
-  if (fn == "p90") return 0.90;
-  if (fn == "p95") return 0.95;
-  if (fn == "p99") return 0.99;
-  return 0.5;  // median
-}
-
-// Exact percentile with linear interpolation between neighbours (like
-// percentile_cont in PostgreSQL and SQLite).
-Value quantile(std::vector<double> v, double q) {
-  if (v.empty()) return Value::null();
-  double pos = q * static_cast<double>(v.size() - 1);
-  size_t lo = static_cast<size_t>(pos);
-  std::nth_element(v.begin(), v.begin() + static_cast<long>(lo), v.end());
-  double a = v[lo];
-  if (lo + 1 >= v.size()) return Value::real(a);
-  double b = *std::min_element(v.begin() + static_cast<long>(lo) + 1, v.end());
-  return Value::real(a + (b - a) * (pos - static_cast<double>(lo)));
-}
-
 struct AggState {
   int64_t count = 0;
   bool is_float = false;
@@ -732,6 +711,27 @@ class Instrumented : public Operator {
 };
 
 }  // namespace
+
+// The fraction a percentile aggregate asks for.
+double quantileOf(const std::string& fn) {
+  if (fn == "p90") return 0.90;
+  if (fn == "p95") return 0.95;
+  if (fn == "p99") return 0.99;
+  return 0.5;  // median
+}
+
+// Exact percentile with linear interpolation between neighbours (like
+// percentile_cont in PostgreSQL and SQLite).
+Value quantile(std::vector<double> v, double q) {
+  if (v.empty()) return Value::null();
+  double pos = q * static_cast<double>(v.size() - 1);
+  size_t lo = static_cast<size_t>(pos);
+  std::nth_element(v.begin(), v.begin() + static_cast<long>(lo), v.end());
+  double a = v[lo];
+  if (lo + 1 >= v.size()) return Value::real(a);
+  double b = *std::min_element(v.begin() + static_cast<long>(lo) + 1, v.end());
+  return Value::real(a + (b - a) * (pos - static_cast<double>(lo)));
+}
 
 void tableScanRange(const PNode& p, std::string* lo, std::string* hi) {
   std::vector<int> prefix(p.table->pk.begin(), p.table->pk.begin() + static_cast<long>(p.eq.size()));

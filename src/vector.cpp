@@ -4,6 +4,7 @@
 #include <chrono>
 #include <queue>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "pkql/codec.h"
 #include "pkql/storage.h"
@@ -268,15 +269,17 @@ class BatchFilter {
 };
 
 // ---------------------------------------------------------------------------
-// Vectorized aggregate: no grouping key or one Int / Text key.
+// Vectorized aggregate: no grouping key, one Int / Text key, or a time
+// bucket of an Int column (bucket(ts, 1h)).
 // ---------------------------------------------------------------------------
 
-enum class VFn { Count, CountCol, Sum, Avg, Min, Max };
+enum class VFn { Count, CountCol, Sum, Avg, Min, Max, CountDistinct, Quantile };
 
 struct VAgg {
   VFn fn;
   int col = -1;
   Type type = Type::Null;
+  double q = 0.5;  // Quantile
 };
 
 struct VState {
@@ -287,6 +290,9 @@ struct VState {
   int64_t imin = 0, imax = 0;
   double fmin = 0, fmax = 0;
   std::string smin, smax;
+  std::unordered_set<int64_t> idistinct;  // count_distinct
+  std::unordered_set<std::string> sdistinct;
+  std::vector<double> values;  // percentiles
 };
 
 void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols, uint32_t i) {
@@ -327,6 +333,13 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
         s.imax = c.ints[i];
       }
       break;
+    case VFn::CountDistinct:
+      if (c.type == Type::Text) s.sdistinct.insert(c.texts[i]);
+      else s.idistinct.insert(c.ints[i]);
+      break;
+    case VFn::Quantile:
+      s.values.push_back(c.type == Type::Float ? c.floats[i] : static_cast<double>(c.ints[i]));
+      break;
     default:
       break;
   }
@@ -335,6 +348,8 @@ void updateState(const VAgg& a, VState& s, const std::vector<ColumnVector>& cols
 // The same result values the row-at-a-time HashAggregate produces.
 Value finalValue(const VAgg& a, const VState& s) {
   if (a.fn == VFn::Count || a.fn == VFn::CountCol) return Value::integer(s.count);
+  if (a.fn == VFn::CountDistinct) return Value::integer(static_cast<int64_t>(s.idistinct.size() + s.sdistinct.size()));
+  if (a.fn == VFn::Quantile) return quantile(s.values, a.q);
   if (!s.seen) return Value::null();
   switch (a.fn) {
     case VFn::Sum: return a.type == Type::Float ? Value::real(s.fsum) : Value::integer(s.isum);
@@ -358,7 +373,12 @@ class VecAggregateOp : public Operator {
       else if (a.fn == "sum") v.fn = VFn::Sum;
       else if (a.fn == "avg") v.fn = VFn::Avg;
       else if (a.fn == "min") v.fn = VFn::Min;
-      else v.fn = VFn::Max;
+      else if (a.fn == "max") v.fn = VFn::Max;
+      else if (a.fn == "count_distinct") v.fn = VFn::CountDistinct;
+      else {
+        v.fn = VFn::Quantile;
+        v.q = quantileOf(a.fn);
+      }
       if (a.arg) {
         v.col = a.arg->index;
         v.type = a.arg->type;
@@ -376,7 +396,20 @@ class VecAggregateOp : public Operator {
     std::vector<uint32_t> sel;
     groups_.clear();
     keys_.clear();
-    int key_col = node_.exprs.empty() ? -1 : node_.exprs[0]->index;
+    // The key column, and for bucket(col, w) the width keys round down to.
+    int key_col = -1;
+    int64_t width = 0;      // > 0: round keys down to multiples of it
+    bool null_key = false;  // bucket() with a width <= 0 is null for every row
+    if (!node_.exprs.empty()) {
+      const Expr& k = *node_.exprs[0];
+      if (k.kind == ExprKind::Call) {
+        key_col = k.args[0]->index;
+        width = k.args[1]->value.asInt();
+        null_key = width <= 0;
+      } else {
+        key_col = k.index;
+      }
+    }
     if (key_col < 0) {  // `aggregate`: one group, even over zero rows
       groups_.emplace_back(aggs_.size());
       keys_.emplace_back();
@@ -400,9 +433,16 @@ class VecAggregateOp : public Operator {
       for (size_t j = 0; j < m; j++) {
         uint32_t i = sel[j];
         uint32_t g;
-        if (kc.nulls[i]) {
+        if (kc.nulls[i] || null_key) {
           if (null_group < 0) null_group = newGroup(Value::null());
           g = static_cast<uint32_t>(null_group);
+        } else if (width > 0) {
+          int64_t x = kc.ints[i], b = x / width;
+          if (x % width != 0 && x < 0) b--;
+          b *= width;
+          auto it = int_groups.find(b);
+          if (it == int_groups.end()) it = int_groups.emplace(b, newGroup(Value::integer(b))).first;
+          g = it->second;
         } else if (kc.type == Type::Text) {
           auto it = text_groups.find(kc.texts[i]);
           if (it == text_groups.end()) it = text_groups.emplace(kc.texts[i], newGroup(kc.get(i))).first;
@@ -561,20 +601,30 @@ bool vectorizable(const PNode& p) {
   if (p.kind == PKind::HashAggregate) {
     if (p.exprs.size() > 1) return false;
     if (p.exprs.size() == 1) {
-      if (!isPlainColumn(p.exprs[0])) return false;
-      Type t = p.exprs[0]->type;
-      if (t != Type::Int && t != Type::Text) return false;
+      const ExprPtr& k = p.exprs[0];
+      bool bucket = k->kind == ExprKind::Call && k->name == "bucket" && isPlainColumn(k->args[0]) &&
+                    k->args[0]->type == Type::Int && k->args[1]->kind == ExprKind::Literal && !k->args[1]->now &&
+                    k->args[1]->value.type() == Type::Int;
+      if (!bucket) {
+        if (!isPlainColumn(k)) return false;
+        if (k->type != Type::Int && k->type != Type::Text) return false;
+      }
     }
     for (const AggSpec& a : p.aggs) {
-      if (a.fn != "count" && a.fn != "sum" && a.fn != "avg" && a.fn != "min" && a.fn != "max") return false;
+      bool pct = a.fn == "median" || a.fn == "p90" || a.fn == "p95" || a.fn == "p99";
+      if (a.fn != "count" && a.fn != "sum" && a.fn != "avg" && a.fn != "min" && a.fn != "max" &&
+          a.fn != "count_distinct" && !pct) {
+        return false;
+      }
       if (!a.arg) {
         if (a.fn != "count") return false;
         continue;
       }
       if (!isPlainColumn(a.arg)) return false;
       Type t = a.arg->type;
-      if ((a.fn == "sum" || a.fn == "avg") && t != Type::Int && t != Type::Float) return false;
+      if ((a.fn == "sum" || a.fn == "avg" || pct) && t != Type::Int && t != Type::Float) return false;
       if ((a.fn == "min" || a.fn == "max") && t != Type::Int && t != Type::Float && t != Type::Text) return false;
+      if (a.fn == "count_distinct" && t != Type::Int && t != Type::Text) return false;
     }
     return true;
   }
