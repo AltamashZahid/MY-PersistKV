@@ -204,22 +204,34 @@ std::string encodeKeyColumns(const Row& row, const std::vector<int>& cols) {
   return out;
 }
 
+// Keys and payloads are built in one string each (these run once per row
+// and index entry on every insert).
 std::string rowKey(const TableSchema& t, const Row& row) {
-  return checkedKey(tablePrefix(t.id) + encodeKeyColumns(row, t.pk));
+  std::string k;
+  k.reserve(24);
+  k += 'r';
+  putId(t.id, k);
+  for (int c : t.pk) encodeKey(row[c], k);
+  return checkedKey(std::move(k));
 }
 
 std::string rowPayload(const TableSchema& t, const Row& row) {
-  Row rest;
-  for (size_t i = 0; i < t.cols.size(); i++) {
-    if (!t.isPkColumn(static_cast<int>(i))) rest.push_back(row[i]);
-  }
   std::string out;
-  encodeRow(rest, out);
+  out.reserve(8 * t.cols.size());
+  for (size_t i = 0; i < t.cols.size(); i++) {
+    if (!t.isPkColumn(static_cast<int>(i))) encodeValue(row[i], out);
+  }
   return out;
 }
 
 std::string indexKey(const TableSchema& t, const IndexSchema& ix, const Row& row) {
-  return checkedKey(indexPrefix(ix.id) + encodeKeyColumns(row, ix.cols) + encodeKeyColumns(row, t.pk));
+  std::string k;
+  k.reserve(32);
+  k += 'x';
+  putId(ix.id, k);
+  for (int c : ix.cols) encodeKey(row[c], k);
+  for (int c : t.pk) encodeKey(row[c], k);
+  return checkedKey(std::move(k));
 }
 
 void decodeStoredRowInto(const TableSchema& t, std::string_view key, std::string_view payload,

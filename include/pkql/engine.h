@@ -66,8 +66,9 @@ class Engine {
   Result describe(const Statement& s);
 
   TableSchema& table(const std::string& name);
-  void stageInsert(TableSchema& t, const std::vector<Row>& rows, pkv::WriteBatch& batch);
+  void stageInsert(TableSchema& t, const std::vector<const Row*>& rows, pkv::WriteBatch& batch);
   Row checkRow(const TableSchema& t, Row row);
+  bool rowFits(const TableSchema& t, const Row& row) const;
   void analyzeTable(TableSchema& t);
 
   struct CachedPlan {

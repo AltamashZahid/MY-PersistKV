@@ -249,28 +249,30 @@ std::string prefixSuccessor(std::string prefix) {
 
 // Row payloads: integers as zigzag varints (small numbers take 1-2 bytes),
 // text as a varint length plus bytes, floats as 8 raw bytes.
-void encodeRow(const Row& values, std::string& out) {
-  for (const Value& v : values) {
-    switch (v.type()) {
-      case Type::Null: out += static_cast<char>(kNull); break;
-      case Type::Bool: out += static_cast<char>(v.asBool() ? kTrue : kFalse); break;
-      case Type::Int:
-        out += static_cast<char>(kInt);
-        putVarint(zigzag(v.asInt()), out);
-        break;
-      case Type::Float: {
-        out += static_cast<char>(kFloat);
-        double d = v.asFloat();
-        out.append(reinterpret_cast<const char*>(&d), 8);
-        break;
-      }
-      case Type::Text:
-        out += static_cast<char>(kText);
-        putVarint(v.asText().size(), out);
-        out += v.asText();
-        break;
+void encodeValue(const Value& v, std::string& out) {
+  switch (v.type()) {
+    case Type::Null: out += static_cast<char>(kNull); break;
+    case Type::Bool: out += static_cast<char>(v.asBool() ? kTrue : kFalse); break;
+    case Type::Int:
+      out += static_cast<char>(kInt);
+      putVarint(zigzag(v.asInt()), out);
+      break;
+    case Type::Float: {
+      out += static_cast<char>(kFloat);
+      double d = v.asFloat();
+      out.append(reinterpret_cast<const char*>(&d), 8);
+      break;
     }
+    case Type::Text:
+      out += static_cast<char>(kText);
+      putVarint(v.asText().size(), out);
+      out += v.asText();
+      break;
   }
+}
+
+void encodeRow(const Row& values, std::string& out) {
+  for (const Value& v : values) encodeValue(v, out);
 }
 
 namespace {

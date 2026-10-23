@@ -30,6 +30,7 @@ std::string prefixSuccessor(std::string prefix);
 
 // Row payload (non-key columns): a type tag per value followed by its bytes.
 void encodeRow(const Row& values, std::string& out);
+void encodeValue(const Value& v, std::string& out);  // one value of a row payload
 // keep[i] == false skips decoding the i-th value (it comes back as null).
 Row decodeRow(std::string_view in, const std::vector<bool>* keep = nullptr);
 // Decodes the next row-payload value into *out, or skips it if out is null.

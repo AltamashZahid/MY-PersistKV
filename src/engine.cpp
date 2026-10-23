@@ -327,6 +327,16 @@ Result Engine::dropIndex(const Statement& s) {
 // Inserts
 // ---------------------------------------------------------------------------
 
+// True when the row can be stored as it is: right width, exact types, and no
+// null in a non-null column. Such rows need no checked copy.
+bool Engine::rowFits(const TableSchema& t, const Row& row) const {
+  if (row.size() != t.cols.size()) return false;
+  for (size_t i = 0; i < row.size(); i++) {
+    if (row[i].isNull() ? !t.cols[i].nullable : row[i].type() != t.cols[i].type) return false;
+  }
+  return true;
+}
+
 Row Engine::checkRow(const TableSchema& t, Row row) {
   if (row.size() != t.cols.size()) {
     throw Error("table " + t.name + " has " + std::to_string(t.cols.size()) + " columns, got " +
@@ -345,18 +355,35 @@ Row Engine::checkRow(const TableSchema& t, Row row) {
   return row;
 }
 
-void Engine::stageInsert(TableSchema& t, const std::vector<Row>& rows, pkv::WriteBatch& batch) {
-  std::unordered_set<std::string> keys;
-  for (const Row& row : rows) {
-    std::string key = rowKey(t, row);
-    std::string existing;
-    if (!keys.insert(key).second || db_.get(key, &existing)) {
-      std::string pk;
-      for (int c : t.pk) pk += (pk.empty() ? "" : ", ") + row[c].literal();
-      throw Error("duplicate key (" + pk + ") in table " + t.name);
-    }
-    batch.put(key, rowPayload(t, row));
-    for (const IndexSchema& ix : t.indexes) batch.put(indexKey(t, ix, row), "");
+void Engine::stageInsert(TableSchema& t, const std::vector<const Row*>& rows, pkv::WriteBatch& batch) {
+  std::vector<std::string> keys(rows.size());
+  for (size_t i = 0; i < rows.size(); i++) keys[i] = rowKey(t, *rows[i]);
+
+  // Primary keys must be new. Sorting finds repeats within the statement, and
+  // one batched lookup checks the store: for appends (ascending ids) the
+  // keys are already sorted and all land past the last leaf, so this is cheap.
+  auto duplicate = [&](const std::string& key) {
+    std::string_view k(key);
+    k.remove_prefix(keyPrefixLength(k));
+    std::string pk;
+    for (size_t c = 0; c < t.pk.size(); c++) pk += (pk.empty() ? "" : ", ") + decodeKey(k).literal();
+    return Error("duplicate key (" + pk + ") in table " + t.name);
+  };
+  std::vector<std::string> sorted = keys;
+  sortKeys(sorted);
+  for (size_t i = 1; i < sorted.size(); i++) {
+    if (sorted[i] == sorted[i - 1]) throw duplicate(sorted[i]);
+  }
+  const std::string* existing = nullptr;
+  db_.multiGetRaw(sorted, [&](size_t i, const char*, size_t) {
+    if (!existing) existing = &sorted[i];
+  });
+  if (existing) throw duplicate(*existing);
+
+  batch.reserve(rows.size() * (1 + t.indexes.size()));
+  for (size_t i = 0; i < rows.size(); i++) {
+    batch.put(std::move(keys[i]), rowPayload(t, *rows[i]));
+    for (const IndexSchema& ix : t.indexes) batch.put(indexKey(t, ix, *rows[i]), std::string());
   }
 }
 
@@ -379,7 +406,9 @@ Result Engine::insert(const Statement& s) {
     rows.push_back(checkRow(t, std::move(row)));
   }
   pkv::WriteBatch batch;
-  stageInsert(t, rows, batch);
+  std::vector<const Row*> ptrs;
+  for (const Row& r : rows) ptrs.push_back(&r);
+  stageInsert(t, ptrs, batch);
   TableSchema updated = t;
   updated.stats.rows += rows.size();
   catalog_.stageStats(updated, batch);
@@ -392,8 +421,21 @@ void Engine::insertRows(const std::string& name, const std::vector<Row>& rows) {
   std::lock_guard<std::mutex> lock(mu_);
   TableSchema& t = table(name);
   for (size_t start = 0; start < rows.size(); start += kLoadChunk) {
-    std::vector<Row> chunk;
-    for (size_t i = start; i < std::min(rows.size(), start + kLoadChunk); i++) chunk.push_back(checkRow(t, rows[i]));
+    // Rows that already fit the schema are stored from the caller's vector;
+    // only rows that need a cast (or fail a check) are copied.
+    size_t end = std::min(rows.size(), start + kLoadChunk);
+    std::vector<Row> fixed;
+    fixed.reserve(end - start);
+    std::vector<const Row*> chunk;
+    chunk.reserve(end - start);
+    for (size_t i = start; i < end; i++) {
+      if (rowFits(t, rows[i])) {
+        chunk.push_back(&rows[i]);
+      } else {
+        fixed.push_back(checkRow(t, rows[i]));
+        chunk.push_back(&fixed.back());
+      }
+    }
     pkv::WriteBatch batch;
     stageInsert(t, chunk, batch);
     TableSchema updated = t;

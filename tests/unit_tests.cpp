@@ -288,6 +288,33 @@ TEST(statements_are_atomic) {
   CHECK(db.checkIntegrity().empty());
 }
 
+TEST(bulk_load_checks_keys_and_types) {
+  Engine db(freshDir("bulk_load"), fast());
+  db.run("table t (id: int key, v: float, s: text)");
+  std::vector<Row> rows;
+  for (int i = 0; i < 5000; i++) rows.push_back({Value::integer(i), Value::integer(i), Value::text("x")});  // int -> float cast
+  db.insertRows("t", rows);
+  CHECK(cell(db, "from t | aggregate { s = sum(v) }") == "12497500.0");
+  CHECK(cell(db, "from t | filter id == 7 | select v") == "7.0");
+  // A key already stored, and a key repeated within one load, are both refused.
+  bool threw = false;
+  try {
+    db.insertRows("t", {{Value::integer(9000), Value::real(1), Value::text("a")}, {Value::integer(42), Value::real(1), Value::text("b")}});
+  } catch (const Error& e) {
+    threw = std::string(e.what()).find("duplicate key (42)") != std::string::npos;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    db.insertRows("t", {{Value::integer(9001), Value::real(1), Value::text("a")}, {Value::integer(9001), Value::real(2), Value::text("b")}});
+  } catch (const Error& e) {
+    threw = std::string(e.what()).find("duplicate key (9001)") != std::string::npos;
+  }
+  CHECK(threw);
+  CHECK(cell(db, "from t | aggregate { n = count() }") == "5000");
+  CHECK(db.checkIntegrity().empty());
+}
+
 // --- Optimizer -------------------------------------------------------------------
 
 TEST(access_path_selection) {
